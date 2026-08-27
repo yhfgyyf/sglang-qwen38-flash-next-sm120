@@ -15,9 +15,9 @@ else
   cuda_toolkit="$(cd "$(dirname "$nvcc_path")/.." && pwd -P)"
 fi
 python_bin="${SGLANG_PYTHON:-python}"
-context_length="${CONTEXT_LENGTH:-65536}"
+context_length="${CONTEXT_LENGTH:-262144}"
 max_total_tokens="${MAX_TOTAL_TOKENS:-$context_length}"
-mem_fraction_static="${MEM_FRACTION_STATIC:-0.92}"
+mem_fraction_static="${MEM_FRACTION_STATIC:-0.98}"
 
 if [[ ! -x "$cuda_toolkit/bin/nvcc" ]]; then
   echo "CUDA Toolkit is invalid: bin/nvcc is missing or not executable" >&2
@@ -34,7 +34,7 @@ export SGLANG_QWEN4_PLE_NVME_PATH="$model_path"
 export SGLANG_QWEN4_PLE_NVME_BACKEND="${SGLANG_QWEN4_PLE_NVME_BACKEND:-io_uring}"
 export SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH="${SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH:-512}"
 export SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES="${SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES:-4096}"
-export SGLANG_QWEN4_PLE_NVME_CACHE_PAGES="${SGLANG_QWEN4_PLE_NVME_CACHE_PAGES:-1048576}"
+export SGLANG_QWEN4_PLE_NVME_CACHE_PAGES="${SGLANG_QWEN4_PLE_NVME_CACHE_PAGES:-5242880}"
 export SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL="${SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL:-10}"
 
 exec "$python_bin" -m sglang.launch_server \
