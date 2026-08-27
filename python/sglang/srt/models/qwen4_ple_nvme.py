@@ -341,6 +341,7 @@ class IoUringPageRowReader:
             raise
         self._fds: dict[Path, int] = {}
         self._cache: OrderedDict[tuple[Path, int], bytes] = OrderedDict()
+        self._nvtx_enabled = os.getenv("SGLANG_QWEN4_PLE_NVME_NVTX", "0") == "1"
 
     def _fd(self, path: Path) -> int:
         descriptor = self._fds.get(path)
@@ -372,10 +373,16 @@ class IoUringPageRowReader:
                 pages[key] = page
         for start in range(0, len(misses), self.max_batch):
             chunk = misses[start : start + self.max_batch]
-            loaded = self._ring.read_pages(
-                [self._fd(path) for path, _ in chunk],
-                [offset for _, offset in chunk],
+            disk_read_context = (
+                torch.cuda.nvtx.range("qwen4_ple_nvme.disk_read_pages")
+                if self._nvtx_enabled
+                else nullcontext()
             )
+            with disk_read_context:
+                loaded = self._ring.read_pages(
+                    [self._fd(path) for path, _ in chunk],
+                    [offset for _, offset in chunk],
+                )
             for key, page in zip(chunk, loaded, strict=True):
                 pages[key] = page
                 if self.cache_pages:
@@ -494,6 +501,7 @@ class NVMePLEEmbedding(nn.Module):
         self._calls = 0
         self._rows = 0
         self._read_seconds = 0.0
+        self._nvtx_enabled = os.getenv("SGLANG_QWEN4_PLE_NVME_NVTX", "0") == "1"
         summary = self.manifest.summary()
         logger.info(
             "Qwen4 PLE NVMe table: %.2f GiB across %d files (%d rows)",
@@ -548,7 +556,13 @@ class NVMePLEEmbedding(nn.Module):
 
     def _timed_read_rows(self, row_ids: list[int]) -> list[bytes]:
         started = time.perf_counter()
-        rows = self._reader.read_rows(row_ids)
+        nvtx_context = (
+            torch.cuda.nvtx.range("qwen4_ple_nvme.read_rows")
+            if self._nvtx_enabled
+            else nullcontext()
+        )
+        with nvtx_context:
+            rows = self._reader.read_rows(row_ids)
         self._calls += 1
         self._rows += len(row_ids)
         self._read_seconds += time.perf_counter() - started
@@ -570,40 +584,53 @@ class NVMePLEEmbedding(nn.Module):
         out: torch.Tensor | None = None,
         stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
-        rows = pending.future.result()
-        expected_shape = (*pending.input_shape, self.embedding_dim)
-        output = (
-            out if out is not None else self.allocate_output(expected_shape, device)
+        wait_context = (
+            torch.cuda.nvtx.range("qwen4_ple_nvme.future_wait")
+            if self._nvtx_enabled
+            else nullcontext()
         )
-        if (
-            tuple(output.shape) != expected_shape
-            or output.dtype != torch.bfloat16
-            or output.device != device
-        ):
-            raise ValueError("invalid NVMe PLE output buffer")
+        with wait_context:
+            rows = pending.future.result()
 
-        raw = b"".join(rows)
-        expected_bytes = math.prod(pending.input_shape) * self.embedding_dim
-        if len(raw) != expected_bytes:
-            raise OSError(
-                f"NVMe PLE read returned {len(raw)} bytes; expected {expected_bytes}"
+        stage_context = (
+            torch.cuda.nvtx.range("qwen4_ple_nvme.stage_and_copy")
+            if self._nvtx_enabled
+            else nullcontext()
+        )
+        with stage_context:
+            expected_shape = (*pending.input_shape, self.embedding_dim)
+            output = (
+                out if out is not None else self.allocate_output(expected_shape, device)
             )
-        if raw:
-            stage = self._stage_buffer(len(raw))
-            ctypes.memmove(stage.data_ptr(), raw, len(raw))
-            stream_context = (
-                torch.cuda.stream(stream) if stream is not None else nullcontext()
-            )
-            with stream_context:
-                device_bytes = stage.to(device=device, non_blocking=True)
-                decoded = device_bytes.view(torch.float8_e4m3fn).to(torch.bfloat16)
-                output.copy_(decoded.view(expected_shape))
-                if self._stage_event is None:
-                    self._stage_event = torch.cuda.Event()
-                self._stage_event.record()
-            if is_in_breakable_cuda_graph():
-                self._stage_event.synchronize()
-        return output
+            if (
+                tuple(output.shape) != expected_shape
+                or output.dtype != torch.bfloat16
+                or output.device != device
+            ):
+                raise ValueError("invalid NVMe PLE output buffer")
+
+            raw = b"".join(rows)
+            expected_bytes = math.prod(pending.input_shape) * self.embedding_dim
+            if len(raw) != expected_bytes:
+                raise OSError(
+                    f"NVMe PLE read returned {len(raw)} bytes; expected {expected_bytes}"
+                )
+            if raw:
+                stage = self._stage_buffer(len(raw))
+                ctypes.memmove(stage.data_ptr(), raw, len(raw))
+                stream_context = (
+                    torch.cuda.stream(stream) if stream is not None else nullcontext()
+                )
+                with stream_context:
+                    device_bytes = stage.to(device=device, non_blocking=True)
+                    decoded = device_bytes.view(torch.float8_e4m3fn).to(torch.bfloat16)
+                    output.copy_(decoded.view(expected_shape))
+                    if self._stage_event is None:
+                        self._stage_event = torch.cuda.Event()
+                    self._stage_event.record()
+                if is_in_breakable_cuda_graph():
+                    self._stage_event.synchronize()
+            return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         return output

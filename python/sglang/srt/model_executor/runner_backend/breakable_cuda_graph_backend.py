@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -125,7 +126,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         )
         size = shape_key.size
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            output_capacity = self._output_rows(warmup_out, size)
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, output_capacity
+            )
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
@@ -143,16 +147,31 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs[shape_key] = capture_inputs
 
     def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+        """Leading-dim row count actually produced by the graph body.
 
         A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        ``cap`` rows. Dataclass outputs may exceed ``cap`` because speculative
+        target-verify graphs are keyed by request count but return one row per
+        verify token.
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            rows = [
+                value.shape[0]
+                for _, value in self._dataclass_items(output)
+                if torch.is_tensor(value) and value.ndim > 0
+            ]
+            unique_rows = set(rows)
+            if len(unique_rows) > 1:
+                raise ValueError(
+                    "BCG dataclass tensor fields must have the same leading "
+                    f"dimension, got {sorted(unique_rows)} for {type(output)}"
+                )
+            return rows[0] if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
@@ -170,6 +189,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return self._map_dataclass(
+                output, lambda value: self._alloc_full_buffer(value, size)
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -183,6 +206,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return self._map_dataclass(
+                output, lambda value: self._slice_output(value, num_tokens)
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -215,6 +242,25 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     tensor, output_buffer.tensors[key], num_tokens
                 )
             return
+        if (
+            dataclasses.is_dataclass(output)
+            and not isinstance(output, type)
+            and type(output_buffer) is type(output)
+        ):
+            output_items = dict(self._dataclass_items(output))
+            buffer_items = dict(self._dataclass_items(output_buffer))
+            if output_items.keys() != buffer_items.keys():
+                raise ValueError(
+                    "BCG dataclass output structure changed between capture sizes: "
+                    f"{output_items.keys()} != {buffer_items.keys()}"
+                )
+            for name, value in output_items.items():
+                self._copy_output_to_buffer(
+                    value,
+                    buffer_items[name],
+                    num_tokens,
+                )
+            return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)
         ):
@@ -230,6 +276,32 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             "Unsupported BCG output buffer pair: "
             f"{type(output)} vs {type(output_buffer)}"
         )
+
+    @staticmethod
+    def _dataclass_items(output: Any) -> list[tuple[str, Any]]:
+        fields = dataclasses.fields(output)
+        field_names = {field.name for field in fields}
+        items = [(field.name, getattr(output, field.name)) for field in fields]
+        if hasattr(output, "__dict__"):
+            items.extend(
+                (name, value)
+                for name, value in vars(output).items()
+                if name not in field_names
+            )
+        return items
+
+    def _map_dataclass(self, output: Any, transform: Callable[[Any], Any]) -> Any:
+        fields = dataclasses.fields(output)
+        field_names = {field.name for field in fields}
+        mapped = dataclasses.replace(
+            output,
+            **{field.name: transform(getattr(output, field.name)) for field in fields},
+        )
+        if hasattr(output, "__dict__"):
+            for name, value in vars(output).items():
+                if name not in field_names:
+                    setattr(mapped, name, transform(value))
+        return mapped
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

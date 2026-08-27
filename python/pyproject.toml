@@ -195,8 +195,9 @@ st-attn = ["setuptools", "torch"]
 vsa = ["setuptools", "torch"]
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
-"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+"Homepage" = "https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120"
+"Bug Tracker" = "https://github.com/yhfgyyf/sglang-qwen38-flash-next-sm120/issues"
+"Upstream" = "https://github.com/sgl-project/sglang"
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
