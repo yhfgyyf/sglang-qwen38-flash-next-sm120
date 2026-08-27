@@ -131,7 +131,9 @@ python -m sglang.launch_server \
   --page-size 64 \
   --mamba-radix-cache-strategy extra_buffer \
   --mamba-track-interval 64 \
-  --chunked-prefill-size 512 \
+  --linear-attn-prefill-backend triton \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
   --max-running-requests 1 \
   --context-length 262144 \
   --max-total-tokens 262144 \
@@ -144,8 +146,8 @@ python -m sglang.launch_server \
   --cuda-graph-backend-prefill tc_piecewise \
   --cuda-graph-max-bs-decode 1 \
   --cuda-graph-bs-decode 1 \
-  --cuda-graph-max-bs-prefill 512 \
-  --cuda-graph-bs-prefill 512 \
+  --cuda-graph-max-bs-prefill 8192 \
+  --cuda-graph-bs-prefill 8192 \
   --host 127.0.0.1 \
   --port 30000
 ```
@@ -166,29 +168,22 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 
 ## Performance results
 
-The measurements use one GPU, concurrency 1, a chunked-prefill size of 512, 512 output tokens, and NEXTN/EAGLE speculative decoding.
+The measurements use one GPU, concurrency 1, an 8,192-token chunked prefill, 512 output tokens, NEXTN/EAGLE speculative decoding, and the NVMe `io_uring` PLE backend with a 20GiB host LRU. KV/Radix state is flushed before each measured request; that operation does not clear the PLE host LRU.
 
-### 8K and 32K input, five runs each
+| Input | PLE state | Runs | Output | Mean TTFT | Prefill TPS | Mean TPOT | Decode TPS | Mean E2E | Mean accept length |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | Warm host LRU | 5 | 512 | 0.957s | 8,558 | 5.947ms | 168.2 | 3.996s | 2.864 |
+| 32K | Warm host LRU | 5 | 512 | 3.948s | 8,300 | 5.731ms | 174.5 | 6.877s | 2.931 |
+| 260,000 | Cold PLE/NVMe | 1 | 512 | 60.643s | 4,287 | 4.967ms | 201.3 | 63.181s | 3.475 |
+| 260,000 | Warm host LRU | 4 | 512 | 35.166s | 7,393 | 6.192ms | 161.5 | 38.330s | 2.825 |
 
-| Input | Output | Runs | Mean TTFT | Prefill TPS | Decode TPS | Mean accept length | Unicode replacement characters |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8K | 512 | 5 | 2.224s | 3,683 | 167.4 | 2.924 | 0 |
-| 32K | 512 | 5 | 10.076s | 3,252 | 141.6 | 2.462 | 0 |
+The first 260K request populated the PLE LRU. Compared with the mean of warm runs 2–5, its cold-cache TTFT was **25.476s** longer. Warm 260K prefill sustained 7,393 tok/s, about 10.9% below the 32K result. Decode TPS is also affected by the NEXTN accept length, so the cold run's higher decode result is not a storage-speedup claim.
 
-### 260,000 input and 512 output, five runs
-
-| PLE state | Sample | TTFT / prefill | Prefill TPS | Decode TPS | End to end | PLE O_DIRECT reads |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Cold start with NVMe misses | Run 1 | 91.726s | 2,834.5 | 136.49 | 95.470s | 13.942GiB |
-| Warm host LRU | Mean of runs 2–5 | 69.004s | 3,768.1 | 141.51 | 72.656s | 0.030GiB |
-
-For the same request and model computation, the cold run exposed an additional **22.722s** of TTFT, or approximately **32.93%**, relative to the warm LRU runs. This end-to-end difference is the visible latency caused by PLE pages coming from storage instead of the host cache. Background reads must not be added directly to model execution time because PLE I/O and GPU computation overlap.
-
-No stable, significant NVMe penalty was observed during decode. Decode TPS also varies with the speculative accept length and generated branch, so a small cold-versus-warm mean difference cannot be attributed to storage alone.
+All measured requests completed without an API error or OOM and produced exactly 512 output tokens. The throughput workload uses random valid token IDs and is not used for text-quality or Unicode-correctness assessment.
 
 ### Correctness and multimodal input
 
-- The five 260K-by-512 requests all returned HTTP 200 without OOM or Unicode replacement characters.
+- A separate readable-prompt 260K-by-512 test returned valid Chinese text without Unicode replacement characters.
 - A 261,120-input and 32-output boundary request returned HTTP 200, and the server remained healthy afterward.
 - A text-and-image request correctly recognized the test image and returned valid Chinese text with `image_tokens=651` and no corrupted characters.
 
@@ -339,7 +334,9 @@ python -m sglang.launch_server \
   --page-size 64 \
   --mamba-radix-cache-strategy extra_buffer \
   --mamba-track-interval 64 \
-  --chunked-prefill-size 512 \
+  --linear-attn-prefill-backend triton \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
   --max-running-requests 1 \
   --context-length 262144 \
   --max-total-tokens 262144 \
@@ -352,8 +349,8 @@ python -m sglang.launch_server \
   --cuda-graph-backend-prefill tc_piecewise \
   --cuda-graph-max-bs-decode 1 \
   --cuda-graph-bs-decode 1 \
-  --cuda-graph-max-bs-prefill 512 \
-  --cuda-graph-bs-prefill 512 \
+  --cuda-graph-max-bs-prefill 8192 \
+  --cuda-graph-bs-prefill 8192 \
   --host 127.0.0.1 \
   --port 30000
 ```
@@ -374,29 +371,22 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 
 ## 性能结果
 
-测试使用单卡、并发 1、chunked prefill 512、输出 512，并开启 NEXTN/EAGLE 推测解码。
+测试使用单卡、并发 1、8,192 token chunked prefill、输出 512、NEXTN/EAGLE 推测解码，以及带 20GiB 主机 LRU 的 NVMe `io_uring` PLE backend。每次正式请求前都会清空 KV/Radix 状态；该操作不会清空 PLE 主机 LRU。
 
-### 8K 与 32K 输入，每种 5 次
+| 输入 | PLE 状态 | 次数 | 输出 | 平均 TTFT | Prefill TPS | 平均 TPOT | Decode TPS | 平均 E2E | 平均接受长度 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | 主机 LRU 热缓存 | 5 | 512 | 0.957s | 8,558 | 5.947ms | 168.2 | 3.996s | 2.864 |
+| 32K | 主机 LRU 热缓存 | 5 | 512 | 3.948s | 8,300 | 5.731ms | 174.5 | 6.877s | 2.931 |
+| 260,000 | PLE/NVMe 冷缓存 | 1 | 512 | 60.643s | 4,287 | 4.967ms | 201.3 | 63.181s | 3.475 |
+| 260,000 | 主机 LRU 热缓存 | 4 | 512 | 35.166s | 7,393 | 6.192ms | 161.5 | 38.330s | 2.825 |
 
-| 输入 | 输出 | 次数 | 平均 TTFT | Prefill TPS | Decode TPS | 平均 accept length | Unicode 替换字符 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8K | 512 | 5 | 2.224s | 3,683 | 167.4 | 2.924 | 0 |
-| 32K | 512 | 5 | 10.076s | 3,252 | 141.6 | 2.462 | 0 |
+第 1 次 260K 请求用于填充 PLE LRU；与第 2–5 次热缓存均值相比，冷缓存 TTFT 多 **25.476s**。260K 热缓存 prefill 达到 7,393 tok/s，比 32K 结果低约 10.9%。Decode TPS 还受 NEXTN 接受长度影响，因此冷缓存轮次更高的 decode 数字不代表存储带来了加速。
 
-### 260,000 输入、512 输出，共 5 次
-
-| PLE 状态 | 样本 | TTFT / Prefill | Prefill TPS | Decode TPS | E2E | PLE O_DIRECT 实读 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 冷启动、NVMe 缺页 | 第 1 次 | 91.726s | 2,834.5 | 136.49 | 95.470s | 13.942GiB |
-| 主机 LRU 热缓存 | 第 2–5 次平均 | 69.004s | 3,768.1 | 141.51 | 72.656s | 0.030GiB |
-
-在相同请求和模型计算下，冷盘相对热 LRU 多暴露 **22.722s** TTFT，即约 **32.93%**。这个端到端差值是 PLE 页面来自硬盘而不是主机缓存时产生的可见额外延迟。PLE I/O 与 GPU 计算存在重叠，因此不能把后台读取时间直接与模型执行时间相加。
-
-Decode 阶段没有观察到稳定、显著的 NVMe 惩罚。Decode TPS 还会受到推测解码 accept length 和生成分支影响，因此不能把小幅冷/热均值差直接归因于存储。
+所有性能请求都没有 API 错误或 OOM，并且准确生成了 512 个输出 token。吞吐压测使用随机合法 token ID，不用于评价文本质量或 Unicode 正确性。
 
 ### 正确性与多模态输入
 
-- 260K×512 的五次请求全部返回 HTTP 200，没有 OOM，也没有 Unicode replacement character。
+- 另一次使用可读提示词的 260K×512 正确性测试返回了正常中文，没有 Unicode replacement character。
 - 261,120 输入、32 输出的边界请求返回 HTTP 200，之后服务健康检查正常。
 - 图文请求成功识别测试图片，返回正常中文；`image_tokens=651`，没有乱码。
 
