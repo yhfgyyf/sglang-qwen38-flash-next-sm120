@@ -302,6 +302,14 @@ def tilelang_qsa_mqa_prefill(
         )
     heads, head_dim = q.shape[1:]
     block_q = max(1, 128 // heads)
+    if (
+        heads == 4
+        and head_dim == 128
+        and torch.cuda.get_device_capability(q.device) == (12, 0)
+    ):
+        # A 1K-row, 128K-tail chunk launches only 32 CTAs with the default
+        # tile on SM120. Eight rows launch 128 CTAs and reduce shared memory.
+        block_q = 8
     padding = (-rows) % block_q
     padded_rows = rows + padding
     # Allocate the padded output once. Appending even a few padding rows with

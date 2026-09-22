@@ -21,6 +21,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
 
@@ -28,6 +29,25 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def known_text_prefill_rope_max_position(forward_batch) -> int | None:
+    """Use host sequence lengths only when text RoPE positions are provably linear."""
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
+        return None
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    mm_inputs = forward_batch.mm_inputs
+    if (
+        not isinstance(seq_lens_cpu, torch.Tensor)
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() == 0
+        or mm_inputs is None
+        or any(mm_input is not None for mm_input in mm_inputs)
+    ):
+        return None
+    return int(seq_lens_cpu.max().item()) - 1
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
@@ -164,6 +184,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        text_rope_max_position: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -183,7 +204,9 @@ class QSAIndexer(MultiPlatformOp):
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
                 self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
+                    text_rope_max_position
+                    if text_rope_max_position is not None
+                    else int(positions.max().item())
                 )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
@@ -602,6 +625,7 @@ class QSAIndexer(MultiPlatformOp):
             positions,
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
+            text_rope_max_position=known_text_prefill_rope_max_position(forward_batch),
             q_heads_padded=(
                 # The tilelang decode MQA requires a query-head multiple of 8;
                 # writing the zero padding from the fused prep kernel avoids a

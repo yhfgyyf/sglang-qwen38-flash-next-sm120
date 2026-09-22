@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
 from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_decode,
     qsa_mqa_prefill,
+    torch_qsa_mqa_prefill,
 )
 from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
@@ -887,6 +888,8 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            seq_lens_cpu=None,
+            mm_inputs=None,
             positions=torch.cat(
                 [torch.arange(15), torch.zeros(num_rows - 15, dtype=torch.long)]
             ),
@@ -1605,6 +1608,20 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
         (columns < starts[:, None]) | (columns >= ends[:, None]), -float("inf")
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rows,keys", [(7, 64), (33, 257), (127, 2048)])
+def test_qsa_sm120_prefill_query_tile_matches_reference(rows, keys):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120-only QSA query-tile tuning")
+    torch.manual_seed(rows * 10000 + keys)
+    q = torch.randn(rows, 4, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, 128, dtype=torch.bfloat16, device="cuda")
+    starts = torch.arange(rows, device="cuda", dtype=torch.int32) % 5
+    ends = torch.full((rows,), keys, device="cuda", dtype=torch.int32)
+    actual = qsa_mqa_prefill(q, k, starts, ends)
+    expected = torch_qsa_mqa_prefill(q, k, starts, ends)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
 
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
