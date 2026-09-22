@@ -2,7 +2,9 @@ import json
 import struct
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
+from unittest.mock import Mock
 
 from sglang.srt.models.qwen4_ple_nvme import (
     IoUringPageRowReader,
@@ -90,6 +92,56 @@ class TestQwen4PLENvmeManifest(CustomTestCase):
             reader._page_keys(RowLocation(path=path, offset=100, nbytes=9000)),
             ((path, 0), (path, 4096), (path, 8192)),
         )
+
+    def test_hot_cache_assembles_rows_without_miss_planning(self):
+        manifest = PLEManifest.from_snapshot(self.snapshot)
+        reader = object.__new__(IoUringPageRowReader)
+        reader.manifest = manifest
+        reader.page_size = 5  # Some four-byte rows cross page boundaries.
+        reader._cache = OrderedDict()
+        reader._load_pages = Mock(side_effect=AssertionError("unexpected miss plan"))
+        row_ids = [2, 0, 1, 2]
+        for row_id in row_ids:
+            for path, offset in reader._page_keys(manifest.locate(row_id)):
+                contents = path.read_bytes()
+                reader._cache[(path, offset)] = contents[offset : offset + 5]
+
+        reference = MMapRowReader(manifest)
+        self.addCleanup(reference.close)
+        self.assertEqual(reader.read_rows(row_ids), reference.read_rows(row_ids))
+        reader._load_pages.assert_not_called()
+
+        # Long prefill chunks with repeated IDs should only slice each hot row
+        # once, while preserving output order and first-use LRU behavior.
+        reader._read_cached_rows = Mock(wraps=reader._read_cached_rows)
+        repeated_ids = row_ids * 2048
+        self.assertEqual(
+            reader.read_rows(repeated_ids), reference.read_rows(repeated_ids)
+        )
+        self.assertEqual(reader._read_cached_rows.call_args.args[0], (2, 0, 1))
+        reader._load_pages.assert_not_called()
+
+    def test_cache_miss_keeps_batched_io_uring_fallback(self):
+        manifest = PLEManifest.from_snapshot(self.snapshot)
+        reader = object.__new__(IoUringPageRowReader)
+        reader.manifest = manifest
+        reader.page_size = 5
+        reader.max_batch = 2
+        reader.cache_pages = 100
+        reader._cache = OrderedDict()
+        reader._nvtx_enabled = False
+        reader._fd = lambda path: path
+        reader._ring = Mock()
+        reader._ring.read_pages.side_effect = lambda paths, offsets: [
+            path.read_bytes()[offset : offset + 5]
+            for path, offset in zip(paths, offsets)
+        ]
+
+        reference = MMapRowReader(manifest)
+        self.addCleanup(reference.close)
+        row_ids = [2, 0, 1, 2] * 2048
+        self.assertEqual(reader.read_rows(row_ids), reference.read_rows(row_ids))
+        self.assertTrue(reader._ring.read_pages.called)
 
 
 if __name__ == "__main__":

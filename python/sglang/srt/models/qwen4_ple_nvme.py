@@ -393,6 +393,25 @@ class IoUringPageRowReader:
         return pages
 
     def read_rows(self, row_ids: Sequence[int]) -> list[bytes]:
+        # Repeated text can produce the same n-gram IDs thousands of times in
+        # one prefill chunk. Build the unique IDs in C so hot-page lookup and
+        # byte slicing run only once per distinct row. Keep near-unique inputs
+        # on the original path to avoid an extra full-size dictionary.
+        if self._cache and len(row_ids) >= 8192:
+            sample = row_ids[:8192]
+            if len(set(sample)) * 4 < len(sample) * 3:
+                unique_ids = tuple(dict.fromkeys(row_ids))
+                cached_rows = self._read_cached_rows(unique_ids)
+                if cached_rows is not None:
+                    by_id = dict(zip(unique_ids, cached_rows, strict=True))
+                    return [by_id[row_id] for row_id in row_ids]
+            else:
+                cached_rows = self._read_cached_rows(row_ids)
+        else:
+            cached_rows = self._read_cached_rows(row_ids)
+        if cached_rows is not None:
+            return cached_rows
+
         locations = [self.manifest.locate(row_id) for row_id in row_ids]
         location_keys = [self._page_keys(location) for location in locations]
         pages = self._load_pages([key for keys in location_keys for key in keys])
@@ -416,6 +435,58 @@ class IoUringPageRowReader:
             if remaining:
                 raise OSError(f"incomplete row read: {remaining} bytes remain")
             output.append(b"".join(parts))
+        return output
+
+    def _read_cached_rows(self, row_ids: Sequence[int]) -> list[bytes] | None:
+        """Avoid building a page plan and RowLocation objects on all-hit reads."""
+        cache = self._cache
+        manifest = self.manifest
+        row_bytes = manifest.row_bytes
+        page_size = self.page_size
+        if not cache or row_bytes <= 0 or row_bytes > page_size:
+            return None
+
+        shards = manifest.shards
+        shard_size = manifest.shard_size
+        seen = set()
+        output = []
+        for row_id in row_ids:
+            if row_id < 0 or row_id >= manifest.total_rows:
+                manifest.locate(row_id)  # Preserve the public range error.
+            shard = shards[row_id // shard_size]
+            if row_id >= shard.row_end:
+                manifest.locate(row_id)
+            path = shard.tensor.path
+            offset = shard.tensor.offset + (row_id - shard.row_start) * row_bytes
+            page_start = offset // page_size * page_size
+            key = (path, page_start)
+            page = cache.get(key)
+            if page is None:
+                return None
+
+            within_page = offset - page_start
+            if within_page + row_bytes <= len(page):
+                row = page[within_page : within_page + row_bytes]
+                touched = (key,)
+            else:
+                first_length = page_size - within_page
+                next_key = (path, page_start + page_size)
+                next_page = cache.get(next_key)
+                if (
+                    first_length <= 0
+                    or len(page) < page_size
+                    or next_page is None
+                    or len(next_page) < row_bytes - first_length
+                ):
+                    return None
+                row = page[within_page:] + next_page[: row_bytes - first_length]
+                touched = (key, next_key)
+
+            for touched_key in touched:
+                if touched_key not in seen:
+                    cache.move_to_end(touched_key)
+                    seen.add(touched_key)
+            output.append(row)
         return output
 
     def close(self) -> None:
