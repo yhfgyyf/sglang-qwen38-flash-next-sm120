@@ -187,6 +187,34 @@ curl http://127.0.0.1:30000/v1/chat/completions \
   }'
 ```
 
+### Optional 512 MiB row cache
+
+The default remains the legacy page cache (`CACHE_MODE=page`, `CACHE_BYTES=-1`),
+including the page-count setting in the launch command above. To cache exact FP8
+rows instead, set these variables before launching the same source build:
+
+```bash
+export SGLANG_QWEN4_PLE_NVME_CACHE_MODE=row
+export SGLANG_QWEN4_PLE_NVME_CACHE_BYTES=536870912
+export SGLANG_QWEN4_PLE_NVME_CACHE_PAGES=0
+```
+
+Row caching requires `io_uring` and an explicit nonnegative byte budget. It reads
+each unique missing row once per gather and preserves duplicate/order semantics.
+The backing page cache is disabled. `CACHE_BYTES=0` disables retention; `page`
+mode also accepts a byte budget. Invalid byte values fail instead of silently
+falling back to the legacy page limit. `mmap` does not support bounded caching.
+
+The byte budget counts retained payload, owned Python keys/values, and live cache
+container overhead. It is **not a process RSS limit**: allocator fragmentation,
+in-flight reads, staging/output buffers, and the rest of the service are separate.
+This change does not enable next-chunk prefetch or the native sparse-GQA prototype.
+
+For local multi-turn text/tool checks, see
+[the dialogue validation harness](benchmark/qwen38_ple/README.md). Use
+`--reasoning-parser qwen3 --tool-call-parser qwen3_coder` for these requests.
+Historical datasets and generated responses must remain outside the repository.
+
 ## Performance results
 
 ### Published-source baseline: 2026-09-23
@@ -250,6 +278,8 @@ python -m pytest -q \
   test/registered/kernels/ops/attention/test_gdn_fused_proj_conv.py \
   test/registered/unit/layers/attention/test_qsa_rope_host_bound.py \
   test/registered/unit/models/test_qwen4_ple_nvme.py \
+  test/registered/unit/models/test_qwen4_ple_row_cache.py \
+  test/registered/unit/models/test_qwen4_ple_dialogue_validation.py \
   test/registered/unit/storage/test_io_uring_reader.py \
   test/registered/unit/model_executor/runner_backend/test_breakable_cuda_graph_backend.py
 ```
@@ -447,6 +477,30 @@ curl http://127.0.0.1:30000/v1/chat/completions \
   }'
 ```
 
+### 可选的 512 MiB 行缓存
+
+默认仍为原来的页缓存（`CACHE_MODE=page`、`CACHE_BYTES=-1`），保留上方启动命令
+的页数限制。要改为缓存精确的 FP8 行，请在启动同一源码构建前设置：
+
+```bash
+export SGLANG_QWEN4_PLE_NVME_CACHE_MODE=row
+export SGLANG_QWEN4_PLE_NVME_CACHE_BYTES=536870912
+export SGLANG_QWEN4_PLE_NVME_CACHE_PAGES=0
+```
+
+行缓存要求 `io_uring` 后端及显式的非负字节预算。每次 gather 只读取一次未命中的
+唯一行，并保留请求顺序及重复行；底层页缓存关闭。`CACHE_BYTES=0` 不保留缓存；
+`page` 模式也支持字节预算。非法预算会报错，不会静默回退到原来的页数限制。
+`mmap` 不支持此有界缓存。
+
+预算包含保留的 payload、缓存拥有的 Python 键值对象和容器开销，**不是进程 RSS
+上限**：分配器碎片、在途读取、staging/output buffer 和服务其他内存另计。
+此修改不启用下一 chunk 预取，也不包含 native sparse-GQA 原型。
+
+本地多轮文本及工具验证请见[对话验证脚本](benchmark/qwen38_ple/README.md)。这类请求
+使用 `--reasoning-parser qwen3 --tool-call-parser qwen3_coder`。历史数据及生成输出
+应保存在仓库之外，不随 PR 发布。
+
 ## 性能结果
 
 ### 已发布源码基线：2026-09-23
@@ -510,6 +564,8 @@ python -m pytest -q \
   test/registered/kernels/ops/attention/test_gdn_fused_proj_conv.py \
   test/registered/unit/layers/attention/test_qsa_rope_host_bound.py \
   test/registered/unit/models/test_qwen4_ple_nvme.py \
+  test/registered/unit/models/test_qwen4_ple_row_cache.py \
+  test/registered/unit/models/test_qwen4_ple_dialogue_validation.py \
   test/registered/unit/storage/test_io_uring_reader.py \
   test/registered/unit/model_executor/runner_backend/test_breakable_cuda_graph_backend.py
 ```

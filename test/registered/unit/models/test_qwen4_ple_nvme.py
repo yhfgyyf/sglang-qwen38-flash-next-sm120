@@ -1,14 +1,18 @@
 import json
+import os
 import struct
+import sys
 import tempfile
 import unittest
 from collections import OrderedDict
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from sglang.srt.models.qwen4_ple_cache import BoundedByteLRU, FP8RowCacheReader
 from sglang.srt.models.qwen4_ple_nvme import (
     IoUringPageRowReader,
     MMapRowReader,
+    NVMePLEEmbedding,
     PLEManifest,
     RowLocation,
 )
@@ -128,6 +132,9 @@ class TestQwen4PLENvmeManifest(CustomTestCase):
         reader.page_size = 5
         reader.max_batch = 2
         reader.cache_pages = 100
+        reader.cache_bytes = -1
+        reader._disk_pages = 0
+        reader._disk_bytes = 0
         reader._cache = OrderedDict()
         reader._nvtx_enabled = False
         reader._fd = lambda path: path
@@ -142,6 +149,135 @@ class TestQwen4PLENvmeManifest(CustomTestCase):
         row_ids = [2, 0, 1, 2] * 2048
         self.assertEqual(reader.read_rows(row_ids), reference.read_rows(row_ids))
         self.assertTrue(reader._ring.read_pages.called)
+
+    def test_byte_bounded_pages_match_legacy_reads_at_tiny_budgets(self):
+        manifest = PLEManifest.from_snapshot(self.snapshot)
+        reference = MMapRowReader(manifest)
+        self.addCleanup(reference.close)
+        for budget in (0, 64, 1024):
+            with self.subTest(budget=budget):
+                reader = object.__new__(IoUringPageRowReader)
+                reader.manifest = manifest
+                reader.page_size = 5
+                reader.max_batch = 2
+                reader.cache_pages = 0
+                reader.cache_bytes = budget
+                reader._disk_pages = reader._disk_bytes = 0
+                reader._cache = BoundedByteLRU(
+                    budget,
+                    key_size=lambda key: sys.getsizeof(key) + sys.getsizeof(key[1]),
+                )
+                reader._nvtx_enabled = False
+                reader._fd = lambda path: path
+                reader._ring = Mock()
+                reader._ring.read_pages.side_effect = lambda paths, offsets: [
+                    path.read_bytes()[offset : offset + 5]
+                    for path, offset in zip(paths, offsets)
+                ]
+                for ids in ([2, 0, 1, 2], [1, 0, 2], [2] * 8192):
+                    self.assertEqual(reader.read_rows(ids), reference.read_rows(ids))
+                    self.assertLessEqual(
+                        reader.snapshot_stats()["accounted_bytes"], budget
+                    )
+                self.assertGreater(reader.snapshot_stats()["disk_bytes"], 0)
+
+    def test_cache_mode_selection_and_invalid_combinations(self):
+        manifest = PLEManifest.from_snapshot(self.snapshot)
+        embedding = object.__new__(NVMePLEEmbedding)
+        embedding.manifest = manifest
+        reader_path = "sglang.srt.models.qwen4_ple_nvme.IoUringPageRowReader"
+
+        base_env = {
+            "SGLANG_QWEN4_PLE_NVME_BACKEND": "io_uring",
+            "SGLANG_QWEN4_PLE_NVME_CACHE_MODE": "page",
+            "SGLANG_QWEN4_PLE_NVME_CACHE_BYTES": "-1",
+        }
+        with patch.dict(os.environ, base_env), patch(reader_path) as reader_cls:
+            embedding._create_reader()
+            self.assertEqual(reader_cls.call_args.kwargs["cache_bytes"], -1)
+
+        mmap_env = base_env | {"SGLANG_QWEN4_PLE_NVME_BACKEND": "mmap"}
+        with (
+            patch.dict(os.environ, mmap_env),
+            patch("sglang.srt.models.qwen4_ple_nvme.MMapRowReader") as mmap_cls,
+        ):
+            self.assertIs(embedding._create_reader(), mmap_cls.return_value)
+
+        unset_bytes_env = {
+            "SGLANG_QWEN4_PLE_NVME_BACKEND": "mmap",
+            "SGLANG_QWEN4_PLE_NVME_CACHE_MODE": "page",
+        }
+        with (
+            patch.dict(os.environ, unset_bytes_env, clear=True),
+            patch("sglang.srt.models.qwen4_ple_nvme.MMapRowReader") as mmap_cls,
+        ):
+            self.assertIs(embedding._create_reader(), mmap_cls.return_value)
+
+        row_env = base_env | {
+            "SGLANG_QWEN4_PLE_NVME_CACHE_MODE": "row",
+            "SGLANG_QWEN4_PLE_NVME_CACHE_BYTES": "1024",
+        }
+        backing = Mock(manifest=manifest)
+        with (
+            patch.dict(os.environ, row_env),
+            patch(reader_path, return_value=backing) as reader_cls,
+        ):
+            reader = embedding._create_reader()
+            self.assertIsInstance(reader, FP8RowCacheReader)
+            self.assertEqual(reader.snapshot_stats()["budget_bytes"], 1024)
+            self.assertEqual(reader_cls.call_args.kwargs["cache_pages"], 0)
+
+        invalid = (
+            ({"SGLANG_QWEN4_PLE_NVME_CACHE_MODE": "row"}, "explicit CACHE_BYTES"),
+            (
+                {"SGLANG_QWEN4_PLE_NVME_CACHE_BYTES": "-2"},
+                "must be -1.*nonnegative",
+            ),
+            ({"SGLANG_QWEN4_PLE_NVME_CACHE_MODE": "invalid"}, "cache mode"),
+            (
+                {
+                    "SGLANG_QWEN4_PLE_NVME_BACKEND": "mmap",
+                    "SGLANG_QWEN4_PLE_NVME_CACHE_BYTES": "0",
+                },
+                "requires the io_uring backend",
+            ),
+        )
+        for overrides, message in invalid:
+            with (
+                self.subTest(overrides=overrides),
+                patch.dict(os.environ, base_env | overrides),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                embedding._create_reader()
+
+    def test_malformed_cache_bytes_fail_before_backend_construction(self):
+        manifest = PLEManifest.from_snapshot(self.snapshot)
+        embedding = object.__new__(NVMePLEEmbedding)
+        embedding.manifest = manifest
+        reader_path = "sglang.srt.models.qwen4_ple_nvme.IoUringPageRowReader"
+        mmap_path = "sglang.srt.models.qwen4_ple_nvme.MMapRowReader"
+        configurations = (
+            ("mmap", "page"),
+            ("io_uring", "page"),
+            ("io_uring", "row"),
+        )
+
+        for backend, mode in configurations:
+            environment = {
+                "SGLANG_QWEN4_PLE_NVME_BACKEND": backend,
+                "SGLANG_QWEN4_PLE_NVME_CACHE_MODE": mode,
+                "SGLANG_QWEN4_PLE_NVME_CACHE_BYTES": "512MiB",
+            }
+            with (
+                self.subTest(backend=backend, mode=mode),
+                patch.dict(os.environ, environment),
+                patch(reader_path) as reader_cls,
+                patch(mmap_path) as mmap_cls,
+                self.assertRaisesRegex(ValueError, "CACHE_BYTES.*integer"),
+            ):
+                embedding._create_reader()
+            reader_cls.assert_not_called()
+            mmap_cls.assert_not_called()
 
 
 if __name__ == "__main__":

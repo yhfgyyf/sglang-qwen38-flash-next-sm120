@@ -16,6 +16,7 @@ import mmap
 import os
 import re
 import struct
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -34,6 +35,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.models.qwen4_ple_cache import BoundedByteLRU, FP8RowCacheReader
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +316,14 @@ class IoUringPageRowReader:
         max_batch: int,
         cache_pages: int,
         page_size: int = 4096,
+        cache_bytes: int = -1,
     ) -> None:
         if not hasattr(os, "O_DIRECT"):
             raise OSError("O_DIRECT is unavailable on this platform")
         if cache_pages < 0:
             raise ValueError("cache_pages cannot be negative")
+        if cache_bytes < -1:
+            raise ValueError("cache_bytes must be -1 (legacy) or nonnegative")
         from sglang.srt.rust_extensions import load_rust_extension
 
         IoUringReader = load_rust_extension(
@@ -329,6 +334,7 @@ class IoUringPageRowReader:
         self.page_size = page_size
         self.max_batch = max_batch
         self.cache_pages = cache_pages
+        self.cache_bytes = cache_bytes
         try:
             self._ring = IoUringReader(queue_depth, max_batch, page_size)
         except OSError as error:
@@ -340,7 +346,16 @@ class IoUringPageRowReader:
                 ) from error
             raise
         self._fds: dict[Path, int] = {}
-        self._cache: OrderedDict[tuple[Path, int], bytes] = OrderedDict()
+        self._cache = (
+            BoundedByteLRU(
+                cache_bytes,
+                key_size=lambda key: sys.getsizeof(key) + sys.getsizeof(key[1]),
+            )
+            if cache_bytes >= 0
+            else OrderedDict()
+        )
+        self._disk_pages = 0
+        self._disk_bytes = 0
         self._nvtx_enabled = os.getenv("SGLANG_QWEN4_PLE_NVME_NVTX", "0") == "1"
 
     def _fd(self, path: Path) -> int:
@@ -383,14 +398,32 @@ class IoUringPageRowReader:
                     [self._fd(path) for path, _ in chunk],
                     [offset for _, offset in chunk],
                 )
+            self._disk_pages += len(chunk)
+            self._disk_bytes += len(chunk) * self.page_size
             for key, page in zip(chunk, loaded, strict=True):
                 pages[key] = page
-                if self.cache_pages:
+                if self.cache_pages or self.cache_bytes >= 0:
                     self._cache[key] = page
-                    self._cache.move_to_end(key)
-                    while len(self._cache) > self.cache_pages:
-                        self._cache.popitem(last=False)
+                    if key in self._cache:
+                        self._cache.move_to_end(key)
+                    if self.cache_bytes < 0:
+                        while len(self._cache) > self.cache_pages:
+                            self._cache.popitem(last=False)
         return pages
+
+    def snapshot_stats(self) -> dict[str, int]:
+        cache = self._cache
+        bounded = isinstance(cache, BoundedByteLRU)
+        return {
+            "entries": len(cache),
+            "payload_bytes": (
+                cache.payload_bytes if bounded else len(cache) * self.page_size
+            ),
+            "accounted_bytes": cache.accounted_bytes if bounded else -1,
+            "budget_bytes": cache.max_bytes if bounded else -1,
+            "disk_pages": self._disk_pages,
+            "disk_bytes": self._disk_bytes,
+        }
 
     def read_rows(self, row_ids: Sequence[int]) -> list[bytes]:
         # Repeated text can produce the same n-gram IDs thousands of times in
@@ -572,6 +605,8 @@ class NVMePLEEmbedding(nn.Module):
         self._calls = 0
         self._rows = 0
         self._read_seconds = 0.0
+        self._gathers = 0
+        self._wait_seconds = 0.0
         self._nvtx_enabled = os.getenv("SGLANG_QWEN4_PLE_NVME_NVTX", "0") == "1"
         summary = self.manifest.summary()
         logger.info(
@@ -583,14 +618,45 @@ class NVMePLEEmbedding(nn.Module):
 
     def _create_reader(self) -> RowReader:
         backend = envs.SGLANG_QWEN4_PLE_NVME_BACKEND.get()
+        cache_mode = envs.SGLANG_QWEN4_PLE_NVME_CACHE_MODE.get()
+        cache_bytes_field = envs.SGLANG_QWEN4_PLE_NVME_CACHE_BYTES
+        if cache_bytes_field.is_set():
+            raw_cache_bytes = os.environ[cache_bytes_field.name]
+            try:
+                cache_bytes = cache_bytes_field.parse(raw_cache_bytes)
+            except ValueError as error:
+                raise ValueError(
+                    f"PLE CACHE_BYTES must be an integer, got {raw_cache_bytes!r}"
+                ) from error
+        else:
+            cache_bytes = cache_bytes_field.get()
+        if cache_mode not in ("page", "row"):
+            raise ValueError(f"unsupported PLE cache mode: {cache_mode!r}")
+        if cache_bytes < -1:
+            raise ValueError("PLE CACHE_BYTES must be -1 (legacy) or nonnegative")
         if backend == "mmap":
+            if cache_mode != "page" or cache_bytes >= 0:
+                raise ValueError("bounded PLE caching requires the io_uring backend")
             return MMapRowReader(self.manifest)
         if backend == "io_uring":
+            if cache_mode == "row":
+                if cache_bytes < 0:
+                    raise ValueError(
+                        "row caching requires an explicit CACHE_BYTES budget"
+                    )
+                backing = IoUringPageRowReader(
+                    self.manifest,
+                    queue_depth=envs.SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH.get(),
+                    max_batch=envs.SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES.get(),
+                    cache_pages=0,
+                )
+                return FP8RowCacheReader(backing, cache_bytes)
             return IoUringPageRowReader(
                 self.manifest,
                 queue_depth=envs.SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH.get(),
                 max_batch=envs.SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES.get(),
                 cache_pages=envs.SGLANG_QWEN4_PLE_NVME_CACHE_PAGES.get(),
+                cache_bytes=cache_bytes,
             )
         raise ValueError(f"unsupported SGLANG_QWEN4_PLE_NVME_BACKEND={backend!r}")
 
@@ -637,15 +703,24 @@ class NVMePLEEmbedding(nn.Module):
         self._calls += 1
         self._rows += len(row_ids)
         self._read_seconds += time.perf_counter() - started
-        interval = envs.SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL.get()
-        if interval > 0 and self._calls % interval == 0:
-            logger.info(
-                "Qwen4 PLE NVMe: calls=%d rows=%d mean_read_ms=%.3f",
-                self._calls,
-                self._rows,
-                self._read_seconds / self._calls * 1000,
-            )
         return rows
+
+    def _log_stats(self, input_shape: tuple[int, ...]) -> None:
+        interval = envs.SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL.get()
+        if interval <= 0 or (input_shape[0] < 1024 and self._gathers % interval):
+            return
+        stats = {
+            "gathers": self._gathers,
+            "demand_calls": self._calls,
+            "demand_rows": self._rows,
+            "read_ms": round(self._read_seconds * 1000, 3),
+            "wait_ms": round(self._wait_seconds * 1000, 3),
+        }
+        if hasattr(self._reader, "snapshot_stats"):
+            stats["cache"] = self._reader.snapshot_stats()
+        if isinstance(self._reader, FP8RowCacheReader):
+            stats["backing"] = self._reader.backing.snapshot_stats()
+        logger.info("Qwen4 PLE stats: %s", json.dumps(stats, sort_keys=True))
 
     @eager_on_graph(True, capture_stub=_capture_finish_gather)
     def finish_gather(
@@ -661,7 +736,11 @@ class NVMePLEEmbedding(nn.Module):
             else nullcontext()
         )
         with wait_context:
+            started = time.perf_counter()
             rows = pending.future.result()
+            self._wait_seconds += time.perf_counter() - started
+        self._gathers += 1
+        self._log_stats(pending.input_shape)
 
         stage_context = (
             torch.cuda.nvtx.range("qwen4_ple_nvme.stage_and_copy")
