@@ -1,5 +1,6 @@
 """Host-known RoPE bounds must be used only for plain-text prefill."""
 
+import unittest
 from types import SimpleNamespace
 
 import torch
@@ -36,3 +37,7 @@ class TestQsaRopeHostBound(CustomTestCase):
         batch.forward_mode = ForwardMode.EXTEND
         batch.seq_lens_cpu = None
         self.assertIsNone(known_text_prefill_rope_max_position(batch))
+
+
+if __name__ == "__main__":
+    unittest.main()
