@@ -18,15 +18,15 @@ _FAST_TOPK_SUPPORTED_K = (512, 2048)
 
 
 @cache_once
-def _jit_fast_topk_module(topk: int) -> Module:
-    """Compile and cache the JIT fast top-k module for a given k."""
+def _jit_fast_topk_module(topk: int, stable_ties: bool) -> Module:
+    """Compile and cache the JIT fast top-k module for one specialization."""
     # Checks on the compile key live here, not in `fast_topk`: `cache_once`
     # keys on `topk`, so this runs once per specialisation.
     if topk not in _FAST_TOPK_SUPPORTED_K:
         raise RuntimeError(
             f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
         )
-    args = make_cpp_args(topk, is_arch_support_pdl())
+    args = make_cpp_args(topk, is_arch_support_pdl(), stable_ties)
     return load_jit(
         "fast_topk",
         *args,
@@ -40,6 +40,8 @@ def fast_topk(
     lengths: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
+    *,
+    stable_ties: bool = False,
 ) -> torch.Tensor:
     """
     Per-row top-k selection over a fp32 score matrix.
@@ -47,7 +49,10 @@ def fast_topk(
     Row b selects the `topk` largest values in
     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
-    Output order within a row is unspecified (atomic collection order).
+    Output order within a row is unspecified (atomic collection order). With
+    ``stable_ties=True``, an over-subscribed cutoff-score group contributes
+    its lowest relative indices; this includes treating -0.0 and +0.0 as one
+    numeric tie group.
 
     Parameters
     ----------
@@ -55,6 +60,7 @@ def fast_topk(
     lengths    : CUDA int32 tensor [B]
     topk       : number of indices per row; 512 or 2048
     row_starts : optional CUDA int32 tensor [B]; defaults to zeros
+    stable_ties: deterministically choose the lowest relative cutoff-tie indices
 
     Returns
     -------
@@ -65,6 +71,6 @@ def fast_topk(
         row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
-    module = _jit_fast_topk_module(topk)
+    module = _jit_fast_topk_module(topk, stable_ties)
     module.fast_topk(score, row_starts, indices, lengths)
     return indices

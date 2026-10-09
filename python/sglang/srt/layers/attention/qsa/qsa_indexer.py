@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import torch
@@ -80,6 +81,7 @@ class QSAIndexer(MultiPlatformOp):
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.block_topk = self.token_topk // self.compress_ratio
+        self.canonical_order = os.environ.get("QWEN38_QSA_CANONICAL_ORDER", "0") == "1"
         if rotary_emb is None:
             raise ValueError("QSAIndexer must reuse its Qwen4-Exp attention RoPE")
         self.rotary_emb = rotary_emb
@@ -294,6 +296,11 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths=metadata.sequence_lengths,
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
+            pending_ring_size=getattr(
+                metadata.token_to_kv_pool,
+                "qsa_pending_ring_size",
+                self.compress_ratio,
+            ),
             is_extend=is_extend,
         )
 
@@ -305,6 +312,11 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            pending_ring_size=getattr(
+                metadata.token_to_kv_pool,
+                "qsa_pending_ring_size",
+                self.compress_ratio,
+            ),
         )
 
 
@@ -501,6 +513,7 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                     topk=self.block_topk,
+                    stable_ties=self.canonical_order,
                 )
             selected = expand_qsa_block_indices(
                 block_indices,
@@ -508,6 +521,7 @@ class QSAIndexer(MultiPlatformOp):
                 sequence_lengths_for_rows[chunk_slice],
                 compress_ratio=self.compress_ratio,
                 token_topk=self.token_topk,
+                canonical_order=self.canonical_order,
             )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
@@ -541,11 +555,16 @@ class QSAIndexer(MultiPlatformOp):
                 compressed_lengths.to(torch.int32),
                 topk=self.block_topk,
                 row_starts=None,
+                stable_ties=self.canonical_order,
             )
         else:
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
-                logits, row_starts, compressed_lengths, topk=self.block_topk
+                logits,
+                row_starts,
+                compressed_lengths,
+                topk=self.block_topk,
+                stable_ties=self.canonical_order,
             )
         return expand_qsa_block_indices(
             block_indices,
@@ -553,6 +572,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths,
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
+            canonical_order=self.canonical_order,
         )
 
     def forward_cuda(

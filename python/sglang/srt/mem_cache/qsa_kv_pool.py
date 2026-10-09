@@ -19,6 +19,18 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
+def qsa_pending_ring_size(compress_ratio: int, max_verify_tokens: int | None) -> int:
+    """Rows per request needed for rollback-free speculative QSA state."""
+    compress_ratio = int(compress_ratio)
+    verify_width = int(max_verify_tokens or 0)
+    if compress_ratio <= 0 or verify_width < 0:
+        raise ValueError(
+            "QSA compression ratio must be positive and verify width non-negative: "
+            f"ratio={compress_ratio}, verify_width={verify_width}"
+        )
+    return compress_ratio + verify_width if verify_width > 1 else compress_ratio
+
+
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
@@ -41,11 +53,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
     ) -> int:
         """Per-token cost of the QSA index caches: the compressed keys only.
 
-        Pre-compression state is a per-request ring of ``compress_ratio``
-        slots (the pending group's members), not a per-token cache, so it
-        does not price per token; its total is bounded by the request-slot
-        count and stays outside this budget like the other per-request
-        buffers.
+        Pre-compression state is a per-request ring (one group in ordinary
+        decode, one group plus the verify width under speculation), not a
+        per-token cache, so it does not price per token; its total is bounded
+        by the request-slot count and stays outside this budget like the other
+        per-request buffers.
         """
         index_k_bytes = _index_k_bytes(
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
@@ -130,21 +142,27 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request RING, not a
-        # per-token cache: once a group's compressed key is written, its raw
-        # members are never read again, and page-granular prefix sharing
-        # keeps every extend chunk group-aligned, so the only state that
-        # must survive a forward is the pending group's members -- at most
-        # ``ratio`` tokens per request, addressed as
-        # ``req_pool_idx * ratio + position % ratio``. Request slot 0 is
-        # never allocated, so ring rows [0, ratio) double as the inert dump
-        # for tokens whose group already compressed in the same forward.
+        # Pre-compression index-K state is a per-request ring. Speculative
+        # verify writes its optimistic tail before acceptance is known, so
+        # that tail must not wrap onto the preceding pending group. Size the
+        # ring for both spans; ordinary decode keeps the minimal ratio-slot
+        # layout. Request slot 0 is never allocated, so its ring rows double
+        # as the inert dump for already-compressed extend tokens.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+
+        max_verify_tokens = max_speculative_num_draft_tokens()
+        self.qsa_max_verify_tokens = int(max_verify_tokens or 1)
+        # ratio + verify_width retains the preceding group and every
+        # optimistic candidate for every partial-accept outcome.
+        self.qsa_pending_ring_size = qsa_pending_ring_size(
+            self.qsa_compress_ratio, max_verify_tokens
+        )
+        ring_slots = self.qsa_num_request_slots * self.qsa_pending_ring_size
         self.qsa_key_state_buffer_pool = [
             torch.zeros(
                 (ring_slots, self.qsa_index_kv_heads, self.qsa_index_head_dim),

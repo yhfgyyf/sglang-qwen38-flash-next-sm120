@@ -242,25 +242,31 @@ def build_pending_ring_slots(
     sequence_lengths: torch.Tensor,
     logical_positions: torch.Tensor,
     compress_ratio: int,
+    pending_ring_size: int,
     is_extend: bool,
 ) -> torch.Tensor:
     """Per-token slots in the per-request pending ring.
 
-    ``req_pool_idx * ratio + position % ratio``: four consecutive positions
-    occupy four distinct slots, which is exactly the pending group. On extend
-    forwards only that pending tail must survive the forward (compression
-    sources members from the chunk itself), so older tokens dump into ring
-    rows [0, ratio) -- request slot 0 is never allocated. Pure tensor
-    arithmetic, CUDA-graph safe.
+    ``req_pool_idx * ring_size + position % ring_size`` keeps the preceding
+    pending group distinct from a speculative verify tail. On ordinary runs
+    ``ring_size == ratio`` retains the minimal layout. On extend forwards
+    only the pending tail must survive the forward (compression sources
+    members from the chunk itself), so older tokens dump into request slot
+    zero -- it is never allocated. Pure tensor arithmetic, CUDA-graph safe.
     """
+    if pending_ring_size < compress_ratio:
+        raise ValueError(
+            "QSA pending ring must cover a compression group: "
+            f"ring_size={pending_ring_size}, ratio={compress_ratio}"
+        )
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * pending_ring_size + positions % pending_ring_size
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % pending_ring_size)
     return slots
 
 
@@ -270,8 +276,14 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    pending_ring_size: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
+    if pending_ring_size < compress_ratio:
+        raise ValueError(
+            "QSA pending ring must cover a compression group: "
+            f"ring_size={pending_ring_size}, ratio={compress_ratio}"
+        )
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
         compress_ratio - 1, -1, -1,
@@ -279,7 +291,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * pending_ring_size + positions % pending_ring_size
 
 
 def build_rope_position_matrix(

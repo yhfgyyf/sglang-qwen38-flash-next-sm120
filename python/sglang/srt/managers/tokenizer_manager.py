@@ -127,6 +127,11 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
+from sglang.srt.speculative.context_tail import (
+    context_tail_request_is_greedy,
+    validate_context_tail_model_config,
+    validate_context_tail_server_args,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -457,6 +462,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        self.qwen38_context_tail_enabled = validate_context_tail_server_args(
+            server_args
+        )
+        if self.qwen38_context_tail_enabled:
+            validate_context_tail_model_config(self.model_config)
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
@@ -1192,7 +1202,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.num_reserved_tokens
+        reserve_tokens = self.num_reserved_tokens
+        if (
+            getattr(self, "qwen38_context_tail_enabled", False)
+            and isinstance(obj, GenerateReqInput)
+            and context_tail_request_is_greedy(self._resolve_sampling_params(obj))
+        ):
+            reserve_tokens = 0
+        input_token_num += reserve_tokens
 
         # Validate input length
         if input_token_num >= self.context_len:
@@ -1359,6 +1376,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
+    def _resolve_sampling_params(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> SamplingParams:
+        """Merge request defaults and return the normalized effective params."""
+
+        request_sampling_params = obj.sampling_params or {}
+        if self.preferred_sampling_params:
+            sampling_kwargs = {
+                **self.preferred_sampling_params,
+                **request_sampling_params,
+            }
+        else:
+            sampling_kwargs = request_sampling_params
+        if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
+            sampling_kwargs = dict(sampling_kwargs)
+            custom_params = dict(sampling_kwargs.get("custom_params") or {})
+            custom_params["thinking_budget"] = obj.max_thinking_tokens
+            sampling_kwargs["custom_params"] = custom_params
+        sampling_params = self.sampling_params_class(**sampling_kwargs)
+        sampling_params.normalize(self.tokenizer)
+        return sampling_params
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1372,20 +1411,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
-        # Parse sampling parameters
-        # Note: if there are preferred sampling params, we use them if they are not
-        # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
-        else:
-            sampling_kwargs = obj.sampling_params
-        if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
-            sampling_kwargs = dict(sampling_kwargs)
-            custom_params = dict(sampling_kwargs.get("custom_params") or {})
-            custom_params["thinking_budget"] = obj.max_thinking_tokens
-            sampling_kwargs["custom_params"] = custom_params
-        sampling_params = self.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
+        sampling_params = self._resolve_sampling_params(obj)
         sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object

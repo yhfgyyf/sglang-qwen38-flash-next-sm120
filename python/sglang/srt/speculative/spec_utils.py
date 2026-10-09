@@ -891,22 +891,39 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
         )
+        mamba_track_indices = batch.mamba_track_indices
+        if mamba_track_indices is not None:
+            mamba_track_indices = req_pool.translate_mamba_indices(mamba_track_indices)
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
+        commit_ple_state = getattr(
+            model_runner.attn_backend,
+            "commit_ple_state_after_mtp_verify",
+            None,
+        )
+        if commit_ple_state is not None:
+            commit_ple_state(
+                state_indices_tensor=state_batch_indices,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
         return
 
     if (

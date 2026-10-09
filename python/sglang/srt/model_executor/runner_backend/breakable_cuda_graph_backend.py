@@ -140,6 +140,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
+        graph.prepare_native(self._pool)
         stored = self._slice_output(self._shared_output_buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored

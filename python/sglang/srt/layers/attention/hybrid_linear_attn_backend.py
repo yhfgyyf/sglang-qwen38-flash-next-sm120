@@ -1281,6 +1281,25 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
         )
 
+        self.commit_ple_state_after_mtp_verify(
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+
+    def commit_ple_state_after_mtp_verify(
+        self,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ):
+        """Commit PLE-only verify side states to physical Mamba slots.
+
+        The caller owns request-to-slot resolution and virtual-to-physical
+        translation, matching the existing legacy verify commit contract.
+        """
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
             last_correct_step_indices,

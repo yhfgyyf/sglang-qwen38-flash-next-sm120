@@ -87,6 +87,14 @@ _use_cutedsl_bf16_gemm = None
 _flashinfer_pr4266_run_splitk_dense = None
 _flashinfer_pr4266_splitk_tactic = None
 _enable_bf16_splitk_gemm = False
+_enable_qwen38_bf16_gdn = False
+_enable_qwen38_bf16_linear = False
+_qwen38_bf16_gdn_rows = (1, 4)
+# Same-stream L2-flushed CUDA-graph medians on the pinned SM120 runtime.
+# Unlisted shapes retain the existing framework path.
+_qwen38_bf16_linear_shapes = {(m, 13312, 2560) for m in (1, 4, 16)} | {
+    (m, 2560, 640) for m in (1, 4, 16, 40)
+}
 _logged_bf16_gemm_shapes = set()
 
 # Qwen4-Exp TP4 decode tactics measured on B300 (sm103) under CUDA graph
@@ -151,8 +159,21 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _flashinfer_pr4266_run_splitk_dense, _flashinfer_pr4266_splitk_tactic
     global _enable_bf16_splitk_gemm
+    global _enable_qwen38_bf16_gdn, _enable_qwen38_bf16_linear
 
     from sglang.srt.utils import is_sm100_supported
+
+    _enable_qwen38_bf16_gdn = get_bool_env_var("QWEN38_BF16_GDN")
+    _enable_qwen38_bf16_linear = get_bool_env_var("QWEN38_BF16_LINEAR")
+    if _enable_qwen38_bf16_gdn or _enable_qwen38_bf16_linear:
+        if not _is_cuda or torch.cuda.get_device_capability() != (12, 0):
+            raise ValueError(
+                "native Qwen38 BF16 GEMM requires the validated SM120 profile"
+            )
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "native Qwen38 BF16 GEMM has not validated deterministic inference"
+            )
 
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
@@ -211,13 +232,9 @@ def _precompile_splitk_tactics() -> None:
     torch.cuda.synchronize()
 
 
-def _flashinfer_pr4266_bf16_gemm(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def _flashinfer_pr4266_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty(
-        (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     tactic = _flashinfer_pr4266_splitk_tactic(
         *_FLASHINFER_PR4266_TUNED_TACTICS[
             (x_2d.shape[0], weight.shape[0], weight.shape[1])
@@ -238,6 +255,41 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
+    if (
+        (
+            (
+                _enable_qwen38_bf16_gdn
+                and m in _qwen38_bf16_gdn_rows
+                and tuple(weight.shape) == (16480, 2560)
+            )
+            or (
+                _enable_qwen38_bf16_linear
+                and (m, *weight.shape) in _qwen38_bf16_linear_shapes
+            )
+        )
+        and x.ndim == 2
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and x.stride(1) == 1
+        and bias is None
+        and not weight.requires_grad
+    ):
+        from sglang.srt.model_executor.qwen38_bf16 import (
+            BF16SmallMGemmConfig,
+            bf16_small_m_linear,
+        )
+
+        key = ("qwen38-native", m, *weight.shape)
+        if key not in _logged_bf16_gemm_shapes:
+            logger.info(
+                "Qwen38 native BF16 GEMM selected: m=%d n=%d k=%d",
+                m,
+                *weight.shape,
+            )
+            _logged_bf16_gemm_shapes.add(key)
+        return bf16_small_m_linear(x, weight, config=BF16SmallMGemmConfig(block_k=128))
     if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
         _log_bf16_gemm_shape(m, weight.shape[0], weight.shape[1])
     if (
@@ -335,6 +387,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            _enable_qwen38_bf16_linear
+            and tuple(layer.weight.shape) in ((13312, 2560), (2560, 640))
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and not layer.weight.requires_grad
+            and bias is None
+        ):
+            # Resolve m inside the opaque op, not as a symbolic compile guard.
+            return bf16_gemm_dispatch(x, layer.weight, bias)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
@@ -1093,10 +1156,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+            )
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
@@ -1106,7 +1169,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         return self.runner.run(dispatch_output, layer)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:

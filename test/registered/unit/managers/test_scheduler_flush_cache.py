@@ -123,5 +123,45 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
+class TestNativeHostKVIdleCheck(unittest.TestCase):
+    def _scheduler(self):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler.is_fully_idle.return_value = True
+        scheduler.enable_unified_memory = False
+        scheduler.enable_hisparse = False
+        scheduler.invariant_checker = MagicMock()
+        scheduler.invariant_checker._check_all_pools.return_value = (False, [])
+        scheduler.pool_stats_observer = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.kv_events_publisher = MagicMock()
+        scheduler.new_token_ratio_tracker = MagicMock()
+        scheduler._qwen38_host_kv_needs_check = True
+        return scheduler
+
+    @patch("sglang.srt.mem_cache.qwen38_host_kv_pool.check_active_host_arenas")
+    def test_checks_once_after_busy_period_drains(self, check):
+        scheduler = self._scheduler()
+        Scheduler.on_idle(scheduler)
+        Scheduler.on_idle(scheduler)
+        check.assert_called_once()
+        self.assertFalse(scheduler._qwen38_host_kv_needs_check)
+
+    @patch("sglang.srt.mem_cache.qwen38_host_kv_pool.check_active_host_arenas")
+    def test_busy_does_not_synchronize(self, check):
+        scheduler = self._scheduler()
+        scheduler.is_fully_idle.return_value = False
+        Scheduler.on_idle(scheduler)
+        check.assert_not_called()
+        self.assertTrue(scheduler._qwen38_host_kv_needs_check)
+
+    @patch("sglang.srt.mem_cache.qwen38_host_kv_pool.check_active_host_arenas")
+    def test_deferred_error_is_not_suppressed(self, check):
+        scheduler = self._scheduler()
+        check.side_effect = RuntimeError("host KV invalid slot")
+        with self.assertRaisesRegex(RuntimeError, "invalid slot"):
+            Scheduler.on_idle(scheduler)
+        self.assertTrue(scheduler._qwen38_host_kv_needs_check)
+
+
 if __name__ == "__main__":
     unittest.main()

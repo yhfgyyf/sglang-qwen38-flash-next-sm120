@@ -27,6 +27,27 @@ def event(delta=None, finish=None, response_id="completion-1"):
 
 
 class DialogueValidationTests(unittest.TestCase):
+    def test_cli_accepts_supported_high_concurrency_profiles(self):
+        for concurrency in (6, 8, 10):
+            with self.subTest(concurrency=concurrency):
+                argv = [
+                    str(SCRIPT),
+                    "--dataset",
+                    "unused.jsonl",
+                    "--output",
+                    "unused-output",
+                    "--concurrency",
+                    str(concurrency),
+                ]
+                with (
+                    patch("sys.argv", argv),
+                    patch.object(
+                        MODULE, "load_samples", side_effect=RuntimeError("parsed-only")
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "parsed-only"),
+                ):
+                    MODULE.main()
+
     def test_sse_utf8_json_and_required_done(self):
         payload = event({"content": "中文路径/测试.py 🙂"}, "stop")
         lines = [

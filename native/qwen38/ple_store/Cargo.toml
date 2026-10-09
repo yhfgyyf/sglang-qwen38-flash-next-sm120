@@ -1,0 +1,17 @@
+[package]
+name = "q38-ple-store"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "q38_ple_store"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+io-uring = "=0.7.14"
+libc = "=0.2.183"
+
+[profile.release]
+panic = "unwind"

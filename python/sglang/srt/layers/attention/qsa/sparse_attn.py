@@ -196,6 +196,19 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    req_to_token=None,
+    req_pool_indices=None,
+    req_stride: tl.constexpr = 0,
+    token_stride: tl.constexpr = 0,
+    kv_capacity: tl.constexpr = 0,
+    k_scale=1.0,
+    v_scale=1.0,
+    PAGED: tl.constexpr = False,
+    FP8_STORAGE: tl.constexpr = False,
+    K_SCALE_PTR: tl.constexpr = False,
+    V_SCALE_PTR: tl.constexpr = False,
+    K_SCALE_0D: tl.constexpr = False,
+    V_SCALE_0D: tl.constexpr = False,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -206,7 +219,17 @@ def _sparse_gqa_chunk_prefill(
     query = (q_start + query_relative).to(tl.int64)
     if query >= q_end:
         return
-    k_start = tl.load(cu_k + batch).to(tl.int64)
+    if PAGED:
+        request = tl.load(req_pool_indices + batch).to(tl.int64)
+        slot_row = req_to_token + request * req_stride
+        k_start = 0
+    else:
+        k_start = tl.load(cu_k + batch).to(tl.int64)
+    if FP8_STORAGE:
+        if K_SCALE_PTR:
+            k_scale = tl.load(k_scale)
+        if V_SCALE_PTR:
+            v_scale = tl.load(v_scale)
     kv_len = tl.load(kv_lens + batch).to(tl.int64)
     visible = query_relative + kv_len - (q_end - q_start) + 1
     row_topk = tl.minimum(topk, visible)
@@ -222,6 +245,13 @@ def _sparse_gqa_chunk_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
+    # PyTorch's BF16 * zero-dimensional device scalar uses a BF16 scalar,
+    # unlike its wrapped Python scalar or a one-element FP32 vector. Match
+    # the existing dequantized-work-buffer route for all three forms.
+    if K_SCALE_0D:
+        k_scale = k_scale.to(q_values.dtype)
+    if V_SCALE_0D:
+        v_scale = v_scale.to(q_values.dtype)
     k_base = k + k_start * sk_n + group * sk_h
     v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
@@ -233,6 +263,14 @@ def _sparse_gqa_chunk_prefill(
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
         valid = token >= 0
+        if PAGED:
+            valid = valid & (token < visible)
+            token = tl.load(
+                slot_row + token.to(tl.int64) * token_stride,
+                mask=valid,
+                other=0,
+            ).to(tl.int64)
+            valid = valid & (token >= 0) & (token < kv_capacity)
         keys = tl.load(
             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -243,6 +281,11 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
+        if FP8_STORAGE:
+            # Match the existing FP8 -> BF16 -> scale -> BF16 work-buffer
+            # conversion, but only in registers for selected rows.
+            keys = (keys.to(q_values.dtype) * k_scale).to(q_values.dtype)
+            values = (values.to(q_values.dtype) * v_scale).to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -263,12 +306,18 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, *, max_query_len=None
+):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    max_q = (
+        int((cu_q[1:] - cu_q[:-1]).max().item())
+        if max_query_len is None
+        else max_query_len
+    )
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
@@ -303,6 +352,84 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def sparse_gqa_fwd_interface_triton_paged_ck(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    kv_lens,
+    req_to_token,
+    req_pool_indices,
+    scale,
+    *,
+    max_query_len,
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    """Chunk prefill directly from FP8 pages, without a full-history copy.
+
+    ``indices`` are logical, causal token positions. Request/slot mapping and
+    FP8 decoding stay on the GPU; max_query_len comes from scheduler CPU
+    metadata rather than a synchronizing device reduction.
+    """
+    if q.dtype != torch.bfloat16 or k.dtype != torch.float8_e4m3fn:
+        raise ValueError("paged QSA prefill requires BF16 queries and FP8 E4M3 KV")
+    if k.shape != v.shape or k.dtype != v.dtype or k.ndim != 3:
+        raise ValueError("paged QSA prefill requires matching NHD K/V pools")
+    if not isinstance(max_query_len, int) or not 1 <= max_query_len <= q.shape[0]:
+        raise ValueError("max_query_len must be a positive scheduler query bound")
+    if cu_q.numel() != req_pool_indices.numel() + 1:
+        raise ValueError("query offsets and request IDs have different batch sizes")
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    if head_dim != k.shape[2] or num_q_heads % num_kv_heads:
+        raise ValueError("incompatible query/KV head geometry")
+    group_size = num_q_heads // num_kv_heads
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty_like(q)
+    _sparse_gqa_chunk_prefill[(max_query_len, req_pool_indices.numel() * num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        indices,
+        cu_q,
+        None,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=max(16, triton.next_power_of_2(group_size)),
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        req_stride=req_to_token.stride(0),
+        token_stride=req_to_token.stride(1),
+        kv_capacity=k.shape[0],
+        k_scale=k_scale,
+        v_scale=v_scale,
+        PAGED=True,
+        FP8_STORAGE=True,
+        K_SCALE_PTR=isinstance(k_scale, torch.Tensor),
+        V_SCALE_PTR=isinstance(v_scale, torch.Tensor),
+        K_SCALE_0D=isinstance(k_scale, torch.Tensor) and k_scale.ndim == 0,
+        V_SCALE_0D=isinstance(v_scale, torch.Tensor) and v_scale.ndim == 0,
         num_warps=warps,
         num_stages=stages,
     )

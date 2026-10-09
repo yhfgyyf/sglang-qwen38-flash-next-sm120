@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
+from sglang.kernels.ops.attention.fla.op import exp, exp2
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
@@ -212,7 +212,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
             )
             b_g = tl.load(p_g, boundary_check=(0,))
-            b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
+            # All valid tokens precede last_idx. A positive difference can be
+            # prefix-sum roundoff, not a reason to erase their state update.
+            b_v = b_v * exp(tl.minimum(b_g_last - b_g, 0.0))[:, None]
             b_g_last = exp(b_g_last)
             b_h1 = b_h1 * b_g_last
             if K > 64:

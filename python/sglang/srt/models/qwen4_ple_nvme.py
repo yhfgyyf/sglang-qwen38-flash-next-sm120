@@ -560,6 +560,26 @@ def _capture_finish_gather(
     return output
 
 
+def _native_start_gather(embedding, input_ids, *, _native_output):
+    from sglang.srt.model_executor.qwen38_native import NativePLEOperation
+
+    if embedding._native is None:
+        raise RuntimeError("native graph requires native PLE storage")
+    return NativePLEOperation("issue", embedding._native, input_ids, input_ids.numel())
+
+
+def _native_finish_gather(
+    embedding, pending, device, out=None, stream=None, *, _native_output
+):
+    from sglang.srt.model_executor.qwen38_native import NativePLEOperation
+
+    if embedding._native is None:
+        raise RuntimeError("native graph requires native PLE storage")
+    return NativePLEOperation(
+        "collect", embedding._native, _native_output, math.prod(pending.input_shape)
+    )
+
+
 class NVMePLEEmbedding(nn.Module):
     """TP1 Qwen4 PLE embedding backed by sparse reads from a local snapshot."""
 
@@ -596,10 +616,25 @@ class NVMePLEEmbedding(nn.Module):
         self.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
-        self._reader = self._create_reader()
-        self._io_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="ple-prefetch"
-        )
+        self._native = None
+        if os.getenv("QWEN38_NATIVE_EXECUTOR", "0") == "1":
+            from sglang.srt.model_executor.qwen38_native import NativePLEPipe
+
+            if envs.SGLANG_QWEN4_PLE_NVME_CACHE_MODE.get() != "row":
+                raise ValueError("native PLE currently requires explicit row cache mode")
+            self._native = NativePLEPipe(
+                self.manifest,
+                cache_bytes=envs.SGLANG_QWEN4_PLE_NVME_CACHE_BYTES.get(),
+                queue_depth=envs.SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH.get(),
+                max_batch=envs.SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES.get(),
+            )
+            self._reader = self._native
+            self._io_executor = None
+        else:
+            self._reader = self._create_reader()
+            self._io_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ple-prefetch"
+            )
         self._stage: torch.Tensor | None = None
         self._stage_event: torch.cuda.Event | None = None
         self._calls = 0
@@ -681,8 +716,14 @@ class NVMePLEEmbedding(nn.Module):
             self.start_gather(input_ids), input_ids.device, out=out
         )
 
-    @eager_on_graph(True, capture_stub=_capture_start_gather)
+    @eager_on_graph(
+        True, capture_stub=_capture_start_gather, native_export=_native_start_gather
+    )
     def start_gather(self, input_ids: torch.Tensor) -> PendingGather:
+        if self._native is not None:
+            pending = PendingGather(None, tuple(input_ids.shape))
+            pending.native_ticket = self._native.issue(input_ids)
+            return pending
         row_ids = (
             input_ids.detach().reshape(-1).to(device="cpu", dtype=torch.int64).tolist()
         )
@@ -722,7 +763,9 @@ class NVMePLEEmbedding(nn.Module):
             stats["backing"] = self._reader.backing.snapshot_stats()
         logger.info("Qwen4 PLE stats: %s", json.dumps(stats, sort_keys=True))
 
-    @eager_on_graph(True, capture_stub=_capture_finish_gather)
+    @eager_on_graph(
+        True, capture_stub=_capture_finish_gather, native_export=_native_finish_gather
+    )
     def finish_gather(
         self,
         pending: PendingGather,
@@ -730,6 +773,12 @@ class NVMePLEEmbedding(nn.Module):
         out: torch.Tensor | None = None,
         stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
+        if self._native is not None:
+            expected_shape = (*pending.input_shape, self.embedding_dim)
+            output = out if out is not None else self.allocate_output(expected_shape, device)
+            if tuple(output.shape) != expected_shape or output.device != device:
+                raise ValueError("invalid native PLE output buffer")
+            return self._native.collect(pending.native_ticket, output, stream)
         wait_context = (
             torch.cuda.nvtx.range("qwen4_ple_nvme.future_wait")
             if self._nvtx_enabled
@@ -789,7 +838,8 @@ class NVMePLEEmbedding(nn.Module):
         return self.gather(input_ids)
 
     def close(self) -> None:
-        self._io_executor.shutdown()
+        if self._io_executor is not None:
+            self._io_executor.shutdown()
         self._reader.close()
 
     def extra_repr(self) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -1557,6 +1558,14 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
+        if os.environ.get("QWEN38_HOST_KV_BYTES", "0") != "0":
+            from sglang.srt.mem_cache.qwen38_host_kv_pool import (
+                Qwen38HostKVPool,
+                validate_host_kv_profile,
+            )
+
+            if validate_host_kv_profile(self):
+                full_pool_class = Qwen38HostKVPool
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend

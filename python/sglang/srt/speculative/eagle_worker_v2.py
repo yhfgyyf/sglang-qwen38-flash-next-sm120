@@ -60,6 +60,13 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.context_tail import (
+    context_tail_trace_enabled,
+    context_tail_trace_near_bound,
+    select_context_tail_verify_width,
+    validate_context_tail_model_config,
+    validate_context_tail_server_args,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -127,6 +134,67 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _trace_context_tail_positions(
+    *,
+    stage: str,
+    positions: torch.Tensor,
+    reqs,
+    width: int,
+    context_len: int,
+):
+    """Synchronously validate actual launch positions under the trace-only flag.
+
+    The environment and CPU committed-length gates deliberately precede every
+    tensor reduction. Normal decode therefore performs no device readback.
+    """
+
+    if not context_tail_trace_enabled():
+        return None
+
+    committed = tuple(int(req.kv_committed_len) for req in reqs)
+    if not context_tail_trace_near_bound(committed, context_len):
+        return None
+    if positions.numel() == 0:
+        return None
+
+    position_min_tensor, position_max_tensor = torch.aminmax(positions)
+    position_min = int(position_min_tensor.item())
+    position_max = int(position_max_tensor.item())
+    bounds_ok = 0 <= position_min <= position_max < context_len
+    record = {
+        "stage": stage,
+        "width": int(width),
+        "req_cpu_committed_min": min(committed),
+        "req_cpu_committed_max": max(committed),
+        "position_min": position_min,
+        "position_max": position_max,
+        "position_device": str(positions.device),
+        "context_len": int(context_len),
+        "bounds_ok": bounds_ok,
+    }
+    logger.info(
+        "QWEN38_CONTEXT_TAIL_TRACE stage=%s width=%s "
+        "req_cpu_committed_min=%s req_cpu_committed_max=%s "
+        "position_min=%s position_max=%s position_device=%s "
+        "context_len=%s bounds_ok=%s",
+        record["stage"],
+        record["width"],
+        record["req_cpu_committed_min"],
+        record["req_cpu_committed_max"],
+        record["position_min"],
+        record["position_max"],
+        record["position_device"],
+        record["context_len"],
+        record["bounds_ok"],
+    )
+    if not bounds_ok:
+        raise RuntimeError(
+            "QWEN38_CONTEXT_TAIL_TRACE observed invalid position bounds: "
+            f"{record}"
+        )
+    return record
+
+
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
     checkpoint configs carry the flag on the nested text_config; read both."""
@@ -168,6 +236,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.qwen38_context_tail_trace_enabled = context_tail_trace_enabled()
 
         self._rebuild_topk1_chain_buffers()
 
@@ -591,6 +660,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if getattr(self, "qwen38_context_tail_trace_enabled", False):
+            _trace_context_tail_positions(
+                stage="draft",
+                positions=forward_batch.positions,
+                reqs=batch.reqs,
+                width=self.speculative_num_draft_tokens,
+                context_len=self.target_worker.model_config.context_len,
+            )
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -946,6 +1023,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        draft_width = batch_result.speculative_num_draft_tokens
+        assert draft_width is not None, "spec-v2 result missing draft width"
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -953,14 +1032,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            num_tokens_per_req=draft_width,
+            num_tokens_for_logprob_per_req=draft_width,
         )
         select_index = (
             torch.arange(
                 0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                len(batch.seq_lens) * draft_width,
+                draft_width,
                 device=self.device,
             )
             + batch_result.accept_lens
@@ -977,7 +1056,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_extend_input,
                 batch,
                 next_token_ids,
-                self.speculative_num_draft_tokens,
+                draft_width,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
@@ -986,6 +1065,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
+            )
+
+        if getattr(self, "qwen38_context_tail_trace_enabled", False):
+            _trace_context_tail_positions(
+                stage="draft_extend",
+                positions=forward_batch.positions,
+                reqs=batch.reqs,
+                width=draft_width,
+                context_len=self.target_worker.model_config.context_len,
             )
 
         # Run draft extend batch in the main compute stream
@@ -1126,6 +1214,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
             nccl_port,
             target_worker,
         )
+        self.qwen38_context_tail_enabled = validate_context_tail_server_args(
+            server_args
+        )
+        if self.qwen38_context_tail_enabled:
+            validate_context_tail_model_config(target_worker.model_config)
+            draft_layers = (
+                self._draft_worker.draft_runner.model_config.num_hidden_layers
+            )
+            if draft_layers != 1:
+                raise ValueError(
+                    "QWEN38_CONTEXT_TAIL=1 requires a single-layer EAGLE/NEXTN "
+                    f"draft model, got {draft_layers} layers"
+                )
+        self.qwen38_context_tail_trace_enabled = (
+            self.qwen38_context_tail_enabled and context_tail_trace_enabled()
+        )
+        self._qwen38_context_tail_active = False
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1232,6 +1337,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            context_tail_width = self.speculative_num_draft_tokens
+            if self.qwen38_context_tail_enabled:
+                context_tail_width = select_context_tail_verify_width(
+                    (req.kv_committed_len for req in batch.reqs),
+                    self.target_worker.model_config.context_len,
+                    batch.enable_overlap,
+                    self.speculative_num_draft_tokens,
+                )
+            context_tail_active = (
+                self.qwen38_context_tail_enabled
+                and self.speculative_num_draft_tokens > 1
+                and context_tail_width == 1
+            )
+            if context_tail_active != self._qwen38_context_tail_active:
+                committed = [req.kv_committed_len for req in batch.reqs]
+                logger.info(
+                    "QWEN38_CONTEXT_TAIL route=%s verify_width=%s "
+                    "configured_width=%s kv_committed=%s overlap=%s context_len=%s",
+                    "tail" if context_tail_active else "normal",
+                    context_tail_width,
+                    self.speculative_num_draft_tokens,
+                    max(committed) if committed else None,
+                    batch.enable_overlap,
+                    self.target_worker.model_config.context_len,
+                )
+                self._qwen38_context_tail_active = context_tail_active
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1250,9 +1381,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
+            if self.speculative_num_steps == 0 or context_tail_active:
+                # Drafting can be disabled by adaptive speculation or narrowed
+                # for the exact-context tail. _draft_extend below still runs,
+                # keeping draft KV current for a later return to normal width.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (
@@ -1291,10 +1423,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
 
-        Used when ``speculative_num_steps == 0`` to skip drafting while still
-        routing through the existing TARGET_VERIFY graph captured at
-        ``draft_token_num=1``: the kernel always accepts the root and samples
-        one new bonus token from target logits -- functionally a plain decode.
+        Used when speculative steps are zero or the exact-context route narrows
+        this forward to one token. The kernel always accepts the root and
+        samples one new bonus token from target logits -- functionally a plain
+        decode. A width-mismatched captured graph rejects the batch and the
+        existing eager fallback handles it.
         """
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -1584,6 +1717,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        draft_width = batch.spec_info.draft_token_num
+        if getattr(self, "qwen38_context_tail_trace_enabled", False):
+            _trace_context_tail_positions(
+                stage="verify",
+                positions=batch.spec_info.positions,
+                reqs=batch.reqs,
+                width=draft_width,
+                context_len=self.target_worker.model_config.context_len,
+            )
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1592,7 +1734,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.topk,
-            num_draft_tokens=self.speculative_num_draft_tokens,
+            num_draft_tokens=draft_width,
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,

@@ -2,6 +2,13 @@
 
 [English](#sglang-qwen38-flash-next-sm120) | [中文版本](#中文版本)
 
+> **Experimental native branch (2026-10-09):** this branch also includes the
+> opt-in [Qwen3.8 SM120 native candidate](native/qwen38/README.md) and a separate
+> [throughput report / 吞吐数据文档](native/qwen38/THROUGHPUT.md).
+> The historical September results below remain unchanged; they use a different
+> workload and metric and are not directly comparable to the new end-to-end table.
+> The native candidate is not a production release, and semantic acceptance is incomplete.
+
 This is an experimental SGLang fork for running `Qwen3.8-Flash-Next-NVFP4` on a single **NVIDIA RTX PRO 6000 Blackwell Workstation GPU (SM120, 96GB)**. It combines pinned upstream Qwen3.8, NVMe-backed PLE, and SM120 QSA sparse-decode implementations with Breakable CUDA Graph fixes, GDN projection/Conv1D fusion, hot-PLE row gathering, and QSA prefill tuning.
 
 Updated **2026-09-24**. The latest published-source measurements are approximately **14.2K / 13.9K / 13.0K prefill tok/s** and **223 / 228 / 223 aggregate decode tok/s** for 8K / 32K / 128K input, respectively: concurrency 1, 512 output tokens, and warm PLE. See [Performance results](#performance-results) for the exact workload and statistics. The newer native sparse-GQA prototype is **not published or enabled in this repository**; its experimental results are reported separately.

@@ -296,6 +296,11 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.context_tail import (
+    context_tail_request_is_greedy,
+    validate_context_tail_model_config,
+    validate_context_tail_server_args,
+)
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -488,6 +493,11 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self.qwen38_context_tail_enabled = validate_context_tail_server_args(
+            self.server_args
+        )
+        if self.qwen38_context_tail_enabled:
+            validate_context_tail_model_config(self.model_config)
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
@@ -2200,17 +2210,44 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        use_context_tail = (
+            getattr(self, "qwen38_context_tail_enabled", False)
+            and context_tail_request_is_greedy(req.sampling_params)
+        )
+        logical_token_cap = (
+            self.model_config.context_len - input_len
+            if use_context_tail
+            else self.max_req_len - input_len - 1
+        )
+        physical_token_cap = (
+            self.max_total_num_tokens * get_parallel().attn_dcp_size
+            - paged_input_len
+            - self.page_size
+            - 1
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
-                - paged_input_len
-                - self.page_size
-                - 1,
+                logical_token_cap,
+                physical_token_cap,
             ),
         )
+        if (
+            use_context_tail
+            and req.sampling_params.max_new_tokens == max_new_tokens
+            and input_len + max_new_tokens == self.model_config.context_len
+            and not getattr(req, "_qwen38_context_tail_admitted", False)
+        ):
+            logger.info(
+                "QWEN38_CONTEXT_TAIL admitted rid=%s input_tokens=%s "
+                "max_new_tokens=%s physical_cap=%s",
+                req.rid,
+                input_len,
+                req.sampling_params.max_new_tokens,
+                physical_token_cap,
+            )
+            req._qwen38_context_tail_admitted = True
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
@@ -3639,6 +3676,8 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+        if os.environ.get("QWEN38_HOST_KV_BYTES", "0") != "0":
+            self._qwen38_host_kv_needs_check = True
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -4049,6 +4088,15 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
+        if getattr(self, "_qwen38_host_kv_needs_check", False):
+            from sglang.srt.mem_cache.qwen38_host_kv_pool import check_active_host_arenas
+
+            # One automatic check after a busy period drains, not per token.
+            # Invalid slots are memory-safe in the kernels but must not remain
+            # silent until an operator happens to request /flush_cache.
+            check_active_host_arenas()
+            self._qwen38_host_kv_needs_check = False
+
         if self.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
@@ -4254,6 +4302,10 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
+            if os.environ.get("QWEN38_HOST_KV_BYTES", "0") != "0":
+                from sglang.srt.mem_cache.qwen38_host_kv_pool import check_active_host_arenas
+
+                check_active_host_arenas()
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()

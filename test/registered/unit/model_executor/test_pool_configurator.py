@@ -6,6 +6,7 @@ invariants hold (tokens * per_token_cost <= available_bytes).
 """
 
 import contextlib
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -114,6 +115,7 @@ def _make_model_runner(
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
+    mc.hf_text_config = mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
     mr.model_config = mc
@@ -233,6 +235,45 @@ class TestDefaultConfigurator(CustomTestCase):
         with mock_cpu_env():
             constrained = cfg.calculate_pool_sizes_from_max_tokens(100, page_size=1)
         self.assertEqual(constrained.max_total_num_tokens, 100)
+
+    def test_native_host_kv_prices_index_only_and_caps_both_entrypoints(self):
+        import torch
+
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self, num_kv_heads=2, head_dim=256, v_head_dim=256, num_layers=12,
+            page_size=64, speculative_algorithm="EAGLE", speculative_num_steps=3,
+            speculative_eagle_topk=1, speculative_num_draft_tokens=4,
+        )
+        mr.kv_cache_dtype = torch.float8_e4m3fn
+        mr.post_capture_kv_active = False
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        text = SimpleNamespace(
+            model_type="qwen4_exp_text", num_hidden_layers=48,
+            num_key_value_heads=2, head_dim=256, indexer_n_heads=4,
+            indexer_kv_heads=1, indexer_head_dim=128, indexer_budget=2048,
+            indexer_compress_ratio=4,
+        )
+        mr.model_config.hf_text_config = text
+        mr.server_args = SimpleNamespace(
+            tp_size=1, pp_size=1, dp_size=1, speculative_algorithm="EAGLE",
+            speculative_num_steps=3, speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4, max_total_tokens=262144,
+        )
+        # 128 allocatable token slots plus one 64-token padding page, including
+        # all twelve target layers and the original one-layer draft.
+        budget = 13 * 1024 * (128 + 64)
+        with patch.dict(os.environ, {
+            "QWEN38_NATIVE_EXECUTOR": "1", "QWEN38_HOST_KV_BYTES": str(budget),
+        }), mock_cpu_env():
+            cfg = DefaultPoolConfigurator(mr)
+            self.assertEqual(cfg._cell_size, 13 * 64)
+            self.assertEqual(cfg.calculate_pool_sizes(10_000_000, 64).max_total_num_tokens, 128)
+            self.assertEqual(cfg.calculate_pool_sizes_from_max_tokens(1024, 64).max_total_num_tokens, 128)
+            # GPU compressed-index headroom remains an independent constraint.
+            self.assertEqual(cfg.calculate_pool_sizes(64 * 13 * 64, 64).max_total_num_tokens, 64)
 
     def test_constraint_page_aligned(self):
         mr, cfg, _ = self._run(10_000_000, page_size=128)

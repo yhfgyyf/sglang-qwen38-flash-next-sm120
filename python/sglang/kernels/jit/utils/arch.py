@@ -176,6 +176,12 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
+    # Keep this import local: architecture utilities load early and are also
+    # imported from paths that participate in sglang.srt initialization.
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_JIT_DISABLE_PDL.get():
+        return False
     if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9

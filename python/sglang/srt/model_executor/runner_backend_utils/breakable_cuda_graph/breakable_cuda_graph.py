@@ -22,6 +22,7 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import os
 import threading
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
@@ -213,7 +214,11 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
+def eager_on_graph(
+    enable: bool,
+    capture_stub: Optional[Callable] = None,
+    native_export: Optional[Callable] = None,
+):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -259,6 +264,17 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
+            if capture.cuda_graph._native_enabled:
+                native_op = (
+                    native_export(
+                        *captured_args,
+                        **captured_kwargs,
+                        _native_output=captured_output,
+                    )
+                    if native_export is not None
+                    else None
+                )
+                capture.cuda_graph._native_ops.append(native_op)
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
@@ -277,9 +293,25 @@ class BreakableCUDAGraph:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
+        self._native_enabled = os.getenv("QWEN38_NATIVE_EXECUTOR", "0") == "1"
+        self._native_ops = []
+        self._native_plan = None
+
+    def prepare_native(self, pool=(0, 0)) -> None:
+        if self._native_enabled:
+            from sglang.srt.model_executor.qwen38_native import NativeGraphPlan
+
+            if self._native_plan is not None:
+                raise RuntimeError("native CUDA graph plan was already compiled")
+            self._native_plan = NativeGraphPlan(self._segments, self._native_ops, pool=pool)
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
+        if self._native_enabled:
+            if self._native_plan is None:
+                raise RuntimeError("native CUDA graph plan is not prepared")
+            self._native_plan.replay(stream)
+            return
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):

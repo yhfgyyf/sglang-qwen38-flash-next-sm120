@@ -11,12 +11,15 @@ logger = logging.getLogger(__name__)
 def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
     hook_specs is a list of dicts from server_args.forward_hooks.
-    Attaches forward hooks to the matching modules.
+    Attaches post-forward hooks by default, or opt-in ``forward_pre`` hooks.
     """
     name_to_module = dict(model.named_modules())
 
     for spec in hook_specs:
         spec_name = spec.get("name", "")
+        hook_type = spec.get("hook_type", "forward")
+        if hook_type not in ("forward", "forward_pre"):
+            raise ValueError(f"Invalid hook_type '{hook_type}' for '{spec_name}'")
         target_patterns = spec.get("target_modules", [])
         if not target_patterns:
             logger.warning(f"Hook spec '{spec_name}' has no 'target_modules', skipping")
@@ -46,14 +49,18 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
 
         if not matched:
             logger.warning(
-                f"No modules matched hook spec '{spec_name}' "
-                f"patterns={target_patterns}"
+                f"No modules matched hook spec '{spec_name}' patterns={target_patterns}"
             )
             continue
 
         for module_name, module in matched:
-            _ = module.register_forward_hook(hook)
-            logger.info(f"Registered forward hook '{spec_name}' " f"on {module_name}")
+            register = (
+                module.register_forward_pre_hook
+                if hook_type == "forward_pre"
+                else module.register_forward_hook
+            )
+            _ = register(hook)
+            logger.info(f"Registered {hook_type} hook '{spec_name}' on {module_name}")
 
 
 def resolve_callable(path: Optional[str]) -> Optional[Callable]:

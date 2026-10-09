@@ -236,6 +236,9 @@ def _run_flashinfer_cutlass(
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
+        enable_pdl=(
+            False if envs.SGLANG_FLASHINFER_CUTLASS_DISABLE_PDL.get() else None
+        ),
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )[0]
 
@@ -389,6 +392,9 @@ def fused_experts_none_to_flashinfer_mxfp4(
         activation_type=ActivationType.Swiglu,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
+        enable_pdl=(
+            False if envs.SGLANG_FLASHINFER_CUTLASS_DISABLE_PDL.get() else None
+        ),
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )
 

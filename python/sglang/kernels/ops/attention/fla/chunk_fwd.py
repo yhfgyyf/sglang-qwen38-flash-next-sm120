@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.op import safe_exp
+from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_tf32_supported,
@@ -184,19 +184,23 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     ############################################################################
 
     if USE_G:
+        # Log-forget gates are nonpositive, but their FP32 parallel prefix
+        # sums can round out of order. Clamp causal decay differences to zero
+        # instead of dropping those edges; the explicit masks below retain
+        # causality and exclude the unused upper triangle.
         # diagonal blocks: g_diff = g_i - g_j within sub-chunk
-        b_A00 *= safe_exp(b_g0[:, None] - b_g0[None, :])
-        b_A11 *= safe_exp(b_g1[:, None] - b_g1[None, :])
-        b_A22 *= safe_exp(b_g2[:, None] - b_g2[None, :])
-        b_A33 *= safe_exp(b_g3[:, None] - b_g3[None, :])
+        b_A00 *= exp(tl.minimum(b_g0[:, None] - b_g0[None, :], 0.0))
+        b_A11 *= exp(tl.minimum(b_g1[:, None] - b_g1[None, :], 0.0))
+        b_A22 *= exp(tl.minimum(b_g2[:, None] - b_g2[None, :], 0.0))
+        b_A33 *= exp(tl.minimum(b_g3[:, None] - b_g3[None, :], 0.0))
 
         # off-diagonal blocks: g_diff = g_row - g_col (cross sub-chunk)
-        b_A10 *= safe_exp(b_g1[:, None] - b_g0[None, :])
-        b_A20 *= safe_exp(b_g2[:, None] - b_g0[None, :])
-        b_A21 *= safe_exp(b_g2[:, None] - b_g1[None, :])
-        b_A30 *= safe_exp(b_g3[:, None] - b_g0[None, :])
-        b_A31 *= safe_exp(b_g3[:, None] - b_g1[None, :])
-        b_A32 *= safe_exp(b_g3[:, None] - b_g2[None, :])
+        b_A10 *= exp(tl.minimum(b_g1[:, None] - b_g0[None, :], 0.0))
+        b_A20 *= exp(tl.minimum(b_g2[:, None] - b_g0[None, :], 0.0))
+        b_A21 *= exp(tl.minimum(b_g2[:, None] - b_g1[None, :], 0.0))
+        b_A30 *= exp(tl.minimum(b_g3[:, None] - b_g0[None, :], 0.0))
+        b_A31 *= exp(tl.minimum(b_g3[:, None] - b_g1[None, :], 0.0))
+        b_A32 *= exp(tl.minimum(b_g3[:, None] - b_g2[None, :], 0.0))
 
     # apply beta to row dimension and mask
     m_d = o_i[:, None] > o_i[None, :]

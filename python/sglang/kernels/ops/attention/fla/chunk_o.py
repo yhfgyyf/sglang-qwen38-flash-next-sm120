@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.op import exp, safe_exp
+from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -103,7 +103,9 @@ def chunk_fwd_kernel_o(
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
         b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
+        # Prefix rounding can make a causal decay difference slightly positive.
+        # Preserve that edge at unit decay; m_A below still masks future tokens.
+        b_A = b_A * exp(tl.minimum(b_g[:, None] - b_g[None, :], 0.0))
 
     o_i = tl.arange(0, BT)
     m_A = o_i[:, None] >= o_i[None, :]

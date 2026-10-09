@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -148,6 +149,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._host_kv_capacity = None
+        if os.environ.get("QWEN38_HOST_KV_BYTES", "0") != "0":
+            from sglang.srt.mem_cache.qwen38_host_kv_pool import (
+                host_kv_token_capacity,
+                validate_host_kv_profile,
+            )
+
+            if validate_host_kv_profile(kvc):
+                self._host_kv_capacity = host_kv_token_capacity(kvc.page_size)
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -238,6 +248,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
+        if self._host_kv_capacity is not None:
+            # Ordinary FP8 K/V is host-resident; only original compressed QSA
+            # keys consume per-token GPU payload. Draft-layer scaling below
+            # still includes its own, independent compressed cache.
+            return self._compute_qsa_cell_size(
+                hf_config=model_config.hf_text_config, num_layers=num_layers
+            )
         from sglang.srt.layers.cp.utils import (
             get_glm_dsa_layer_split_effective_num_layers,
         )
@@ -454,12 +471,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if self._cell_size
             else self._zero_kv_max_tokens
         )
+        if self._host_kv_capacity is not None:
+            max_total_num_tokens = min(max_total_num_tokens, self._host_kv_capacity)
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._host_kv_capacity is not None:
+            max_total_num_tokens = min(max_total_num_tokens, self._host_kv_capacity)
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 

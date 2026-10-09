@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.qsa_decode import (
     sparse_gqa_decode_physical_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -39,6 +41,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
+    sparse_gqa_fwd_interface_triton_paged_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -233,7 +236,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         ] = {}
         self._cuda_graph_max_tokens = 0
         self._fa2_scratch: Dict[
-            Tuple[int, int, torch.dtype, torch.device],
+            Tuple[bool, int, int, torch.dtype, torch.device],
             Tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self._graph_seq_lens = None
@@ -251,6 +254,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
+        self._host_slot_scratch = {}
+        self._host_prefill_scratch = None
+        self._host_gather_reported = False
+        self._paged_fp8_prefill = os.environ.get("QWEN38_PAGED_FP8_PREFILL", "0") == "1"
+        self._paged_fp8_prefill_reported = False
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
 
@@ -265,16 +273,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if int(getattr(spec_info, "topk", 1) or 1) != 1:
             raise NotImplementedError(
-                "Qwen QSA target verification supports only " "speculative_eagle_topk=1"
+                "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        pool = getattr(self, "token_to_kv_pool", None)
+        pending_ring_size = getattr(
+            pool, "qsa_pending_ring_size", 2 * self.compress_ratio
+        )
+        max_verify_tokens = getattr(pool, "qsa_max_verify_tokens", self.compress_ratio)
+        if draft_tokens > max_verify_tokens:
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                "Qwen QSA verify width exceeds its pending-ring allocation: "
+                f"draft_tokens={draft_tokens}, capacity={max_verify_tokens}, "
+                f"ring_size={pending_ring_size}, "
+                f"compress ratio={self.compress_ratio}"
             )
 
     @staticmethod
@@ -748,6 +760,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                     sequence_lengths=sequence_lengths,
                     logical_positions=ring_logical_positions,
                     compress_ratio=self.compress_ratio,
+                    pending_ring_size=getattr(
+                        self.token_to_kv_pool,
+                        "qsa_pending_ring_size",
+                        self.compress_ratio,
+                    ),
                     is_extend=group_member_rows is not None,
                 )
                 if write_locs.numel():
@@ -766,6 +783,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                             group_end_positions=group_positions.long(),
                             sequence_ids=group_sequence_ids.long(),
                             compress_ratio=self.compress_ratio,
+                            pending_ring_size=getattr(
+                                self.token_to_kv_pool,
+                                "qsa_pending_ring_size",
+                                self.compress_ratio,
+                            ),
                         )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -1193,6 +1215,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                pending_ring_size=getattr(pool, "qsa_pending_ring_size", ratio),
                 is_extend=False,
             )
         )
@@ -1202,6 +1225,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                pending_ring_size=getattr(pool, "qsa_pending_ring_size", ratio),
             ).to(torch.int32)
         )
 
@@ -1390,9 +1414,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1448,37 +1470,140 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
+        host_pool = self._get_host_kv_pool()
+        if host_pool is None and self._paged_fp8_prefill:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            if k_buffer.dtype == torch.float8_e4m3fn:
+                k_scale, v_scale = self._kv_scales(layer)
+                output = sparse_gqa_fwd_interface_triton_paged_ck(
+                    q,
+                    k_buffer,
+                    pool.get_value_buffer(layer.layer_id),
+                    topk_indices,
+                    cu_seqlens_q,
+                    forward_batch.seq_lens,
+                    req_to_token,
+                    forward_batch.req_pool_indices,
+                    layer.scaling,
+                    max_query_len=max(extend_lens),
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+                if not self._paged_fp8_prefill_reported:
+                    logger.info(
+                        "Qwen38 paged FP8 chunk-prefill executed: full-history "
+                        "KV copies=0, query-length device sync=0"
+                    )
+                    self._paged_fp8_prefill_reported = True
+                return self._pad_extend_output(output, num_output_rows)
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        if host_pool is not None:
+            slots = torch.cat(
+                [
+                    req_to_token[req_indices[i], : sequence_lens[i]]
+                    for i in range(len(sequence_lens))
+                ]
+            ).contiguous()
+            capacity = slots.numel()
+            buffers = self._host_prefill_scratch
+            if buffers is None or buffers[0].shape[0] < capacity:
+                shape = (capacity, host_pool.head_num, host_pool.head_dim)
+                buffers = (
+                    torch.empty(shape, dtype=host_pool.dtype, device=q.device),
+                    torch.empty(shape, dtype=host_pool.dtype, device=q.device),
+                )
+                self._host_prefill_scratch = buffers
+            # Eager full-context scratch is separate from captured decode
+            # scratch: a longer chunk must never replace a graph's backing.
+            packed_k, packed_v = (buffer[:capacity] for buffer in buffers)
+            host_pool.gather(
+                pool.full_attention_layer_id_mapping[layer.layer_id],
+                slots,
+                packed_k,
+                packed_v,
             )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_parts = [
+                k_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            v_parts = [
+                v_buffer.index_select(
+                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+                )
+                for i in range(len(sequence_lens))
+            ]
+            packed_k, packed_v = torch.cat(k_parts), torch.cat(v_parts)
+        if packed_k.dtype == torch.float8_e4m3fn:
+            k_scale, v_scale = self._kv_scales(layer)
+            # The chunk-prefill kernel uses BF16 tensor-core operands. Only
+            # its transient work buffers are decoded; the persistent cache
+            # remains FP8 in both GPU and host placement modes.
+            packed_k = self._decode_fp8(packed_k, q.dtype, k_scale)
+            packed_v = self._decode_fp8(packed_v, q.dtype, v_scale)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_query_len=max(extend_lens),
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _get_host_kv_pool(self):
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        return full_pool if getattr(full_pool, "native_host_kv", False) else None
+
+    @staticmethod
+    def _kv_scales(layer):
+        def get(name):
+            value = getattr(layer, name + "_float", None)
+            if value is None:
+                value = getattr(layer, name, None)
+            return 1.0 if value is None else value
+
+        return get("k_scale"), get("v_scale")
+
+    @staticmethod
+    def _decode_fp8(value, dtype, scale):
+        decoded = value.to(dtype)
+        return (
+            decoded
+            if isinstance(scale, (int, float)) and scale == 1
+            else (decoded * scale).to(dtype)
+        )
+
+    def _store_kv(self, layer, locations, keys, values):
+        pool = self.token_to_kv_pool
+        full_pool = getattr(pool, "full_kv_pool", pool)
+        if getattr(full_pool, "dtype", None) == torch.float8_e4m3fn:
+            k_scale, v_scale = self._kv_scales(layer)
+            # Do not let the generic pool's in-place scaling mutate the
+            # original current-chunk K/V used by no-prefix prefill.
+            keys = (
+                keys
+                if isinstance(k_scale, (int, float)) and k_scale == 1
+                else keys / k_scale
+            ).to(torch.float8_e4m3fn)
+            values = (
+                values
+                if isinstance(v_scale, (int, float)) and v_scale == 1
+                else values / v_scale
+            ).to(torch.float8_e4m3fn)
+        pool.set_kv_buffer(layer, locations, keys, values)
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
@@ -1501,8 +1626,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        is_graph: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        key = (num_kv_heads, head_dim, dtype, device)
+        # An oversized eager batch must not replace graph-owned storage.
+        key = (is_graph, num_kv_heads, head_dim, dtype, device)
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
             shape = (capacity, num_kv_heads, head_dim)
@@ -1538,6 +1665,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata,
         topk_indices: torch.Tensor,
         trtllm_decode,
+        host_pool=None,
     ) -> torch.Tensor:
         """Selected KV packs into page-aligned row strides so a static
         arange block table can drive the trtllm-gen paged decode kernel;
@@ -1562,32 +1690,69 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
+        num_kv_heads = (
+            host_pool.head_num if host_pool is not None else k_buffer.shape[1]
+        )
+        head_dim = host_pool.head_dim if host_pool is not None else k_buffer.shape[2]
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
-            k_buffer.dtype,
-            k_buffer.device,
+            num_kv_heads,
+            head_dim,
+            host_pool.dtype if host_pool is not None else k_buffer.dtype,
+            device,
+            is_graph=metadata.is_cuda_graph,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_strided,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
+        row_requests = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
         )
-        num_kv_heads = k_buffer.shape[1]
-        head_dim = k_buffer.shape[2]
+        if host_pool is not None:
+            from sglang.srt.mem_cache.qwen38_host_kv_pool import selected_host_slots
+
+            key = (metadata.is_cuda_graph, stride, device)
+            slot_buffer = self._host_slot_scratch.get(key)
+            capacity = max(capacity_rows, batch) * stride
+            if slot_buffer is None or slot_buffer.numel() < capacity:
+                slot_buffer = torch.empty(capacity, dtype=torch.int32, device=device)
+                self._host_slot_scratch[key] = slot_buffer
+            physical_slots = selected_host_slots(
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                topk_indices,
+                sequence_lens,
+                stride,
+                slot_buffer,
+            )
+            host_pool.gather_selected(
+                self.token_to_kv_pool.full_attention_layer_id_mapping[layer.layer_id],
+                physical_slots,
+                packed_k[: batch * stride],
+                packed_v[: batch * stride],
+            )
+            if not self._host_gather_reported:
+                logger.info(
+                    "Qwen38 native host KV selected gather executed: "
+                    "storage=%s attention=trtllm_gen rows=%d topk=%d",
+                    host_pool.dtype,
+                    batch,
+                    topk,
+                )
+                self._host_gather_reported = True
+        else:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+            )
         kc = (
             packed_k[: batch * stride]
             .view(-1, page, num_kv_heads, head_dim)
@@ -1602,6 +1767,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
             )
+        k_scale, v_scale = (
+            self._kv_scales(layer)
+            if packed_k.dtype == torch.float8_e4m3fn
+            else (1.0, 1.0)
+        )
         output = trtllm_decode(
             query=q.contiguous(),
             kv_cache=(kc, vc),
@@ -1609,8 +1779,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables=block_tables,
             seq_lens=valid_counts,
             max_seq_len=stride,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=layer.scaling * k_scale,
+            bmm2_scale=v_scale,
+            enable_pdl=(False if envs.SGLANG_QSA_TRTLLM_DISABLE_PDL.get() else None),
         )
         return output.reshape(q.shape[0], -1)
 
@@ -1628,9 +1799,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1642,9 +1811,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
+        host_pool = self._get_host_kv_pool()
+        k_buffer = (
+            None if host_pool is not None else pool.get_key_buffer(layer.layer_id)
+        )
+        v_buffer = (
+            None if host_pool is not None else pool.get_value_buffer(layer.layer_id)
+        )
         if not q.is_cuda:
+            if host_pool is not None:
+                raise RuntimeError(
+                    "native host KV requires the validated SM120 GPU path"
+                )
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
@@ -1663,6 +1841,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+                host_pool=host_pool,
+            )
+
+        if host_pool is not None:
+            raise RuntimeError(
+                "native host KV requires the SM120 trtllm-gen attention backend"
             )
 
         if torch.cuda.get_device_capability(q.device) == (12, 1):
@@ -1704,6 +1888,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.shape[2],
             k_buffer.dtype,
             k_buffer.device,
+            is_graph=metadata.is_cuda_graph,
         )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
@@ -1722,6 +1907,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
+        if packed_k.dtype == torch.float8_e4m3fn:
+            k_scale, v_scale = self._kv_scales(layer)
+            packed_k = self._decode_fp8(packed_k, q.dtype, k_scale)
+            packed_v = self._decode_fp8(packed_v, q.dtype, v_scale)
         output = flash_attn_varlen_func(
             q=q,
             k=packed_k,

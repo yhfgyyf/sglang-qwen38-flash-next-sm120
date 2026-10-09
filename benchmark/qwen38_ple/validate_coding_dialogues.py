@@ -712,7 +712,7 @@ def main():
     )
     parser.add_argument("--endpoint", default="http://127.0.0.1:30001")
     parser.add_argument("--model", default="default")
-    parser.add_argument("--concurrency", type=int, choices=[1, 4], default=4)
+    parser.add_argument("--concurrency", type=int, choices=[1, 4, 6, 8, 10], default=4)
     parser.add_argument(
         "--subset", choices=["full", "calibration", "smoke"], default="full"
     )

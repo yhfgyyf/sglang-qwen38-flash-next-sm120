@@ -14,7 +14,9 @@ never need the host.
   lengths, the boundary write slot (last raw slot // ratio; non-boundary
   rows keep the inert reserved slot 0), the row's page table of full-KV
   page ids, and the layer-independent indexer inputs (logical position,
-  pending-ring state slot, trailing-group member ring slots).
+  pending-ring state slot, trailing-group member ring slots). The pending
+  ring size is independent of the compression ratio so speculative verify
+  candidates cannot wrap onto the preceding unfinished group.
 
 Both are launched once eagerly at capture warmup (JIT compile + dummy
 layout) and then recorded into the main CUDA graph through
@@ -125,6 +127,7 @@ def _qsa_graph_row_metadata_kernel(
     req_to_token_row_stride,
     max_pages,
     RATIO: tl.constexpr,
+    RING_SIZE: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
 ):
@@ -148,11 +151,14 @@ def _qsa_graph_row_metadata_kernel(
     tl.store(write_locs_ptr + row, write_loc)
 
     tl.store(logical_positions_ptr + row, current)
-    tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+    tl.store(
+        state_slots_ptr + row,
+        req * RING_SIZE + (current % RING_SIZE).to(tl.int64),
+    )
     ring_base = row.to(tl.int64) * RATIO
     for k in tl.static_range(RATIO):
         member = tl.maximum(current - (RATIO - 1 - k), 0)
-        slot = req * RATIO + (member % RATIO).to(tl.int64)
+        slot = req * RING_SIZE + (member % RING_SIZE).to(tl.int64)
         tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are the request's FULL-KV page ids, read from the
@@ -235,6 +241,9 @@ def launch_graph_metadata(
         req_to_token.stride(0),
         max_pages,
         RATIO=indexer.compress_ratio,
+        RING_SIZE=getattr(
+            pool, "qsa_pending_ring_size", indexer.compress_ratio
+        ),
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=128,
         num_warps=1,

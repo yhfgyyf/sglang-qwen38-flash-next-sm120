@@ -910,6 +910,10 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Reproducibility controls for call sites where FlashInfer otherwise chooses
+    # its own PDL policy. Both preserve dependency defaults when unset.
+    SGLANG_FLASHINFER_CUTLASS_DISABLE_PDL = EnvBool(False)
+    SGLANG_QSA_TRTLLM_DISABLE_PDL = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
@@ -951,6 +955,9 @@ class Envs:
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    # Opt out of PDL at the shared JIT architecture selector. This is resolved
+    # on the selector's first cached use, so it must be set before startup.
+    SGLANG_JIT_DISABLE_PDL = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 

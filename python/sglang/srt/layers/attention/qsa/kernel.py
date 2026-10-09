@@ -25,18 +25,28 @@ def qsa_fast_topk(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     topk: int,
+    *,
+    stable_ties: bool = False,
 ) -> torch.Tensor:
     """Select compressed blocks, with a compatibility fallback for top-k 512."""
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
     if logits.is_cuda:
-        if topk == 512:
+        if topk == 512 or (stable_ties and topk == 2048):
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
+            # Stable tie membership is also a JIT-only extension, including
+            # for top-k 2048 when the legacy AOT op is installed.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk
 
-            return fast_topk(logits, lengths, topk=512, row_starts=starts)
+            return fast_topk(
+                logits,
+                lengths,
+                topk=topk,
+                row_starts=starts,
+                stable_ties=stable_ties,
+            )
 
         from sgl_kernel import top_k as top_k_module
 
@@ -69,9 +79,14 @@ def qsa_fast_topk(
         length = int(lengths[row])
         width = min(length, topk)
         if width:
-            output[row, :width] = torch.topk(
-                logits[row, start : start + length], width
-            ).indices.to(torch.int32)
+            section = logits[row, start : start + length]
+            if stable_ties:
+                selected = torch.argsort(
+                    section, descending=True, stable=True
+                )[:width]
+            else:
+                selected = torch.topk(section, width).indices
+            output[row, :width] = selected.to(torch.int32)
     return output
 
 
@@ -98,6 +113,8 @@ def torch_expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    *,
+    canonical_order: bool = False,
 ) -> torch.Tensor:
     """Expand compressed block indices into fixed-width logical token indices."""
 
@@ -114,6 +131,10 @@ def torch_expand_qsa_block_indices(
 
     device = block_indices.device
     blocks = block_indices.long()
+    if canonical_order:
+        invalid = torch.iinfo(blocks.dtype).max
+        blocks = torch.where(blocks >= 0, blocks, invalid).sort(dim=1).values
+        blocks = torch.where(blocks == invalid, -1, blocks)
     offsets = torch.arange(compress_ratio, device=device, dtype=torch.long)
     expanded = blocks.unsqueeze(-1) * compress_ratio + offsets
     expanded = torch.where(
@@ -162,6 +183,7 @@ def _expand_qsa_block_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     FINAL_TOPK: tl.constexpr,
     OUTPUT_BLOCK_SIZE: tl.constexpr,
+    CANONICAL_ORDER: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, OUTPUT_BLOCK_SIZE)
@@ -169,11 +191,25 @@ def _expand_qsa_block_indices_kernel(
 
     source_block_cols = cols // COMPRESS_RATIO
     offsets = cols % COMPRESS_RATIO
-    blocks = tl.load(
-        block_indices + row * block_stride + source_block_cols,
-        mask=(cols < TOKEN_TOPK) & (source_block_cols < BLOCK_TOPK),
-        other=-1,
-    )
+    if CANONICAL_ORDER:
+        block_cols = tl.arange(0, BLOCK_TOPK)
+        canonical_blocks = tl.load(block_indices + row * block_stride + block_cols)
+        canonical_blocks = tl.where(canonical_blocks >= 0, canonical_blocks, 0x7FFFFFFF)
+        canonical_blocks = tl.sort(canonical_blocks, dim=0)
+        canonical_blocks = tl.where(
+            canonical_blocks == 0x7FFFFFFF, -1, canonical_blocks
+        )
+        blocks = tl.gather(
+            canonical_blocks,
+            tl.minimum(source_block_cols, BLOCK_TOPK - 1),
+            axis=0,
+        )
+    else:
+        blocks = tl.load(
+            block_indices + row * block_stride + source_block_cols,
+            mask=(cols < TOKEN_TOPK) & (source_block_cols < BLOCK_TOPK),
+            other=-1,
+        )
     expanded = blocks * COMPRESS_RATIO + offsets
     expanded_valid = (
         (cols < TOKEN_TOPK)
@@ -231,6 +267,8 @@ def triton_expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    *,
+    canonical_order: bool = False,
 ) -> torch.Tensor:
     """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
     rows, block_topk = block_indices.shape
@@ -252,6 +290,7 @@ def triton_expand_qsa_block_indices(
         TOKEN_TOPK=token_topk,
         FINAL_TOPK=final_topk,
         OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
+        CANONICAL_ORDER=canonical_order,
         num_warps=8,
     )
     return output
@@ -263,6 +302,8 @@ def expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    *,
+    canonical_order: bool = False,
 ) -> torch.Tensor:
     """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
 
@@ -284,6 +325,7 @@ def expand_qsa_block_indices(
             sequence_lengths.to(device=block_indices.device).contiguous(),
             compress_ratio,
             token_topk,
+            canonical_order=canonical_order,
         )
     return torch_expand_qsa_block_indices(
         block_indices,
@@ -291,6 +333,7 @@ def expand_qsa_block_indices(
         sequence_lengths,
         compress_ratio,
         token_topk,
+        canonical_order=canonical_order,
     )
 
 
